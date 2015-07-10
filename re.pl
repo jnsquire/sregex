@@ -134,7 +134,7 @@ my $nfa = gen_nfa();
 draw_nfa($nfa);
 
 my $dfa = gen_dfa($nfa);
-warn Dumper($dfa);
+#warn Dumper($dfa);
 draw_dfa($dfa);
 
 sub gen_nfa () {
@@ -276,7 +276,7 @@ sub gen_nfa_edge_label ($) {
             if ($opcode eq 'assert') {
                 $label = $v;
             } elsif ($opcode eq 'any') {
-                $label = '.';
+                $label = 'any';
             } elsif ($opcode eq 'char') {
                 $label = "'" . escape_char($v) . "'";
             } elsif ($opcode eq 'in') {
@@ -365,11 +365,11 @@ sub gen_dfa ($) {
         # de-duplicate elements in @all_nfa_edges?
         my $dfa_edges = gen_dfa_edges(\@dfa_nodes, \%dfa_node_hash, \@all_nfa_edges, $nfa, \$idx);
         $dfa_node->{edges} = $dfa_edges;
+        if (@$dfa_edges == 1 && !defined $dfa_edges->[0][0]) {
+            $dfa_edges->[0][0] = 0;
+            $dfa_edges->[0][1] = 255;
+        }
         $i++;
-    }
-
-    for my $dfa_node (@dfa_nodes) {
-        delete $dfa_node->{nfa_nodes};
     }
 
     return \@dfa_nodes;
@@ -377,11 +377,9 @@ sub gen_dfa ($) {
 
 sub gen_dfa_edges ($$$$$) {
     my ($dfa_nodes, $dfa_node_hash, $nfa_edges, $nfa, $idx_ref) = @_;
-    my %left_end_hash;
-    my %right_end_hash;
-    my %prio;
-    my @endpoints;
+    my (%left_end_hash, %right_end_hash, %prio, @endpoints);
     my $prio = 0;
+    my $accept_edge;
     for my $nfa_edge (@$nfa_edges) {
         $prio{$nfa_edge} = $prio++;
         my $to = $nfa_edge->[-1];
@@ -424,7 +422,8 @@ sub gen_dfa_edges ($$$$$) {
             add_to_hash(\%left_end_hash, $from, $nfa_edge);
             add_to_hash(\%right_end_hash, 255, $nfa_edge);
         } elsif ($opcode eq 'match') {
-            # TODO
+            $accept_edge = $nfa_edge;
+            last;
         } else {
             die "unknown bytecode opcode: $opcode";
         }
@@ -440,23 +439,25 @@ sub gen_dfa_edges ($$$$$) {
         if ($right_nfa_edges) {
             my @saved = @active_nfa_edges;
             if (remove_from_set(\@active_nfa_edges, $right_nfa_edges)) {
-                warn "HERE right $p (prev $prev)";
+                #warn "HERE right $p (prev $prev)";
                 push @dfa_edges, [$prev, $p,
                     [sort { $prio{$a} <=> $prio{$b} } @saved]];
                 if (@active_nfa_edges) {
                     $prev = $p + 1;
                 }
             } else {
-                warn "HERE singular right $p (prev $prev)";
+                #warn "HERE singular right $p (prev $prev)";
                 $singular = 1;
             }
         }
         my $left_nfa_edges = $left_end_hash{$p};
         if ($left_nfa_edges) {
             if (defined $prev) {
-                warn "HERE left $p (prev $prev)";
-                push @dfa_edges, [$prev, $p - 1,
-                    [sort { $prio{$a} <=> $prio{$b} } @active_nfa_edges]];
+                #warn "HERE left $p (prev $prev)";
+                if ($prev <= $p - 1) {
+                    push @dfa_edges, [$prev, $p - 1,
+                        [sort { $prio{$a} <=> $prio{$b} } @active_nfa_edges]];
+                }
             }
             add_to_set(\@active_nfa_edges, $left_nfa_edges);
             $prev = $p;
@@ -469,12 +470,16 @@ sub gen_dfa_edges ($$$$$) {
         }
     }
 
+    if (defined $accept_edge) {
+        push @dfa_edges, [undef, undef, [$accept_edge]];
+    }
+
     my %targets;
     for my $dfa_edge (@dfa_edges) {
         my $target = $dfa_edge->[-1];
         #warn "DFA edge target: ", Dumper($target);
         my $key = gen_dfa_hash_key($target);
-        warn "dfa state key: ", $key;
+        #warn "dfa state key: ", $key;
         my $old_edge = $targets{$key};
         if (defined $old_edge) {
             pop @$dfa_edge;
@@ -485,6 +490,10 @@ sub gen_dfa_edges ($$$$$) {
         $targets{$key} = $dfa_edge;
         my $target_dfa_node = $dfa_node_hash->{$key};
         if (!defined $target_dfa_node) {
+            my $is_accept;
+            if (defined $accept_edge && @$target == 1 && $target->[-1] eq $accept_edge) {
+                $is_accept = 1;
+            }
             my @nfa_nodes;
             for my $nfa_edge (@$target) {
                 my $nfa_idx = $nfa_edge->[-1];
@@ -496,6 +505,7 @@ sub gen_dfa_edges ($$$$$) {
                 edges => undef,
                 actions => $target,
                 idx => $$idx_ref++,
+                $is_accept ? (accept => 1) : (),
             };
             push @$dfa_nodes, $target_dfa_node;
             $dfa_node_hash->{$key} = $target_dfa_node;
@@ -504,6 +514,7 @@ sub gen_dfa_edges ($$$$$) {
     }
 
     @dfa_edges = grep { defined } @dfa_edges;
+
     #warn "DFA edges: ", Dumper(\@dfa_edges);
     return \@dfa_edges;
 }
@@ -578,7 +589,7 @@ sub draw_dfa ($) {
             my $to = $e->[-1];
             my $to_idx = $to->{idx};
             $graph->add_edge("n$from_idx" => "n$to_idx", label => $label,
-                             len => max(length($label) / 6, 1));
+                             len => max(length($label) / 6, 1.5));
         }
     }
 
@@ -608,8 +619,18 @@ sub escape_range ($$) {
     if ($negate) {
         $s = "[^";
     } else {
-        if (@$range == 2 && $range->[0] == $range->[1]) {
-            return escape_char($range->[0]);
+        if (@$range == 2) {
+            if (defined $range->[0]) {
+                if ($range->[0] == $range->[1]) {
+                    return "'" . escape_char($range->[0]) . "'";
+                }
+                if ($range->[0] == 0 && $range->[1] == 255) {
+                    return "any";
+                }
+            } else {
+                # epsilon edge to an "accept" state
+                return "else";
+            }
         }
         $s = "[";
     }
