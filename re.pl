@@ -10,7 +10,7 @@ use List::MoreUtils qw( uniq firstidx );
 use List::Util qw( first max );
 use Carp qw( croak carp );
 
-sub add_edges ($$$$);
+sub add_nfa_edges ($$$$);
 sub gen_nfa_edge_label ($);
 sub escape_char ($);
 sub escape_range_char ($);
@@ -159,7 +159,7 @@ sub gen_nfa () {
     for my $node (@nodes) {
         my %visited;
         my $idx = $node->{idx};
-        add_edges($node, $idx == 0 ? 0 : $idx + 1, \%visited, undef);
+        add_nfa_edges($node, $idx == 0 ? 0 : $idx + 1, \%visited, undef);
     }
 
     return \@nodes;
@@ -196,7 +196,7 @@ sub draw_nfa ($) {
     $graph->as_png("nfa.png");
 }
 
-sub add_edges ($$$$) {
+sub add_nfa_edges ($$$$) {
     my ($from_node, $idx, $visited, $to_nodes) = @_;
 
     #warn "add edges: $from_node->{idx} => $idx";
@@ -208,7 +208,7 @@ sub add_edges ($$$$) {
         if ($opcode eq 'split') {
             my $y = $bc->[2];
             if (!$visited->{$y}) {
-                add_edges($from_node, $y, $visited, $to_nodes);
+                add_nfa_edges($from_node, $y, $visited, $to_nodes);
                 return;
             }
         }
@@ -218,7 +218,7 @@ sub add_edges ($$$$) {
     $visited->{$idx} = 1;
 
     if ($opcode eq 'jmp') {
-        add_edges($from_node, $bc->[1], $visited, $to_nodes);
+        add_nfa_edges($from_node, $bc->[1], $visited, $to_nodes);
         return;
     }
 
@@ -226,8 +226,8 @@ sub add_edges ($$$$) {
         my $x = $bc->[1];
         my $y = $bc->[2];
         my $forked = $to_nodes ? [@$to_nodes] : undef;
-        add_edges($from_node, $x, $visited, $to_nodes);
-        add_edges($from_node, $y, $visited, $forked);
+        add_nfa_edges($from_node, $x, $visited, $to_nodes);
+        add_nfa_edges($from_node, $y, $visited, $forked);
         return;
     }
 
@@ -237,7 +237,7 @@ sub add_edges ($$$$) {
             $to_nodes = [];
         }
         push @$to_nodes, $idx;
-        add_edges($from_node, $idx + 1, $visited, $to_nodes);
+        add_nfa_edges($from_node, $idx + 1, $visited, $to_nodes);
         return;
     }
 
@@ -339,6 +339,7 @@ sub escape_range_char ($) {
 
 sub gen_dfa ($) {
     my ($nfa) = @_;
+
     my $dfa_node = {
         nfa_nodes => [$nfa->[0]],
         edges => undef,
