@@ -29,6 +29,7 @@ sub remove_from_set ($$);
 sub gen_dfa_node_label ($);
 sub gen_dfa_edge_label ($);
 sub gen_perl_from_dfa ($);
+sub canon_range ($);
 
 $Data::Dumper::Terse = 1;
 
@@ -144,7 +145,7 @@ my $dfa = gen_dfa($nfa);
 draw_dfa($dfa);
 
 my $perl = gen_perl_from_dfa($dfa);
-print $perl;
+#print $perl;
 my $matcher = eval $perl;
 if ($@) {
     die "failed to eval perl code: $@";
@@ -182,8 +183,19 @@ sub gen_nfa () {
                 edges => [],
                 $idx == 0 ? (start => 1) : (),
             };
-            if (defined $opcode && $opcode eq 'match') {
-                $node->{accept} = 1;
+            if (defined $opcode) {
+                #warn $opcode;
+                if ($opcode eq 'match') {
+                    $node->{accept} = 1;
+                } elsif ($opcode eq 'in' or $opcode eq 'notin') {
+                    #warn "HERE";
+                    my @args = @$bc;
+                    shift @args;
+                    #warn "pre: @args";
+                    canon_range(\@args);
+                    #warn "post: @args";
+                    @$bc = ($opcode, @args);
+                }
             }
             push @nodes, $node;
         }
@@ -406,10 +418,10 @@ sub gen_dfa ($) {
         my $dfa_edges = gen_dfa_edges(\@dfa_nodes, \%dfa_node_hash, \@all_nfa_edges, $nfa, \$idx);
         $dfa_node->{edges} = $dfa_edges;
 
-        warn "DFA node ", gen_dfa_node_label($dfa_node), "\n";
+        #warn "DFA node ", gen_dfa_node_label($dfa_node), "\n";
         for my $dfa_edge (@$dfa_edges) {
             my $target = $dfa_edge->[-1];
-            warn " to DFA node ", gen_dfa_node_label($target), "\n";
+            #warn " to DFA node ", gen_dfa_node_label($target), "\n";
             my $from_actions = $dfa_node->{actions};
             my $to_actions = $target->{actions};
             my @paths;
@@ -421,7 +433,7 @@ sub gen_dfa ($) {
                     my $key = "$a-$b";
                     if ($nfa_paths{$key}) {
                         push @paths, [$row1, $row2];
-                        warn "    path: $row1 -> $row2\n";
+                        #warn "    path: $row1 -> $row2\n";
                     }
                     $row2++;
                 }
@@ -459,6 +471,7 @@ sub gen_dfa_edges ($$$$$) {
         } elsif ($opcode eq 'in') {
             my @args = @$bc;
             shift @args;
+            #canon_range(\@args);
             #warn "args: ", Dumper(\@args);
             for (my $i = 0; $i < @args; $i += 2) {
                 my ($a, $b)  = ($args[$i], $args[$i + 1]);
@@ -469,6 +482,7 @@ sub gen_dfa_edges ($$$$$) {
         } elsif ($opcode eq 'notin') {
             my @args = @$bc;
             shift @args;
+            #canon_range(\@args);
             #warn "args: ", Dumper(\@args);
             my $from = 0;
             for (my $i = 0; $i < @args; $i += 2) {
@@ -577,6 +591,46 @@ sub gen_dfa_edges ($$$$$) {
 
     #warn "DFA edges: ", Dumper(\@dfa_edges);
     return \@dfa_edges;
+}
+
+sub canon_range ($) {
+    my ($args) = @_;
+    my (%left_end_hash, %right_end_hash, @endpoints);
+    for (my $i = 0; $i < @$args; $i += 2) {
+        my ($a, $b)  = ($args->[$i], $args->[$i + 1]);
+        push @endpoints, $a, $b;
+        $left_end_hash{$a}++;
+        $right_end_hash{$b}++;
+    }
+    @endpoints = uniq sort { $a <=> $b } @endpoints;
+    my @new;
+    my $cnt = 0;
+    my $prev;
+    for my $p (@endpoints) {
+        my $new_prev;
+        my $c1 = $left_end_hash{$p};
+        if (defined $c1) {
+            $cnt += $c1;
+        }
+        my $c2 = $right_end_hash{$p};
+        if (defined $c2) {
+            $cnt -= $c2;
+        }
+        if ($cnt == 0) {
+            if (defined $prev) {
+                push @new, $prev, $p;
+                undef $prev;
+            } else {
+                # singular
+                push @new, $p, $p;
+            }
+        } else {
+            if (!defined $prev) {
+                $prev = $p;
+            }
+        }
+    }
+    @$args = @new;
 }
 
 sub gen_dfa_actions ($$) {
