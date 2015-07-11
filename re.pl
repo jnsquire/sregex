@@ -509,36 +509,50 @@ sub gen_dfa_edges ($$$$$) {
     #warn "endpoints: ", Dumper(\@endpoints);
     my (@active_nfa_edges, @dfa_edges, $prev);
     for my $p (@endpoints) {
-        my $singular;
-        my $right_nfa_edges = $right_end_hash{$p};
-        if ($right_nfa_edges) {
-            my @saved = @active_nfa_edges;
-            if (remove_from_set(\@active_nfa_edges, $right_nfa_edges)) {
-                #warn "HERE right $p (prev $prev)";
-                push @dfa_edges, [$prev, $p, undef, gen_dfa_actions \@saved, \%prio];
-                if (@active_nfa_edges) {
-                    $prev = $p + 1;
-                }
-            } else {
-                #warn "HERE singular right $p (prev $prev)";
-                $singular = 1;
-            }
-        }
-        my $left_nfa_edges = $left_end_hash{$p};
-        if ($left_nfa_edges) {
-            if (defined $prev) {
-                #warn "HERE left $p (prev $prev)";
-                if ($prev <= $p - 1) {
-                    push @dfa_edges,
-                        [$prev, $p - 1, undef, gen_dfa_actions \@active_nfa_edges, \%prio];
-                }
-            }
-            add_to_set(\@active_nfa_edges, $left_nfa_edges);
+        if (!@active_nfa_edges) {
+            die if defined $prev;
             $prev = $p;
-            if ($singular) {
+            my $left_nfa_edges = $left_end_hash{$p};
+            die unless defined $left_nfa_edges;
+            add_to_set(\@active_nfa_edges, $left_nfa_edges);
+
+            my $right_nfa_edges = $right_end_hash{$p};
+            if (defined $right_nfa_edges) {
+                # singular
                 push @dfa_edges, [$prev, $p, undef, gen_dfa_actions \@active_nfa_edges, \%prio];
                 remove_from_set(\@active_nfa_edges, $right_nfa_edges);
-                $prev++;
+                if (@active_nfa_edges) {
+                    $prev++;
+                }
+            }
+
+        } else {
+            # pending right endpoint
+            die unless defined $prev;
+
+            my $right_nfa_edges = $right_end_hash{$p};
+            my $left_nfa_edges = $left_end_hash{$p};
+
+            if (defined $right_nfa_edges && defined $left_nfa_edges) {
+                if ($prev <= $p - 1) {
+                    push @dfa_edges, [$prev, $p - 1, undef, gen_dfa_actions \@active_nfa_edges, \%prio];
+                }
+                add_to_set(\@active_nfa_edges, $left_nfa_edges);
+                push @dfa_edges, [$p, $p, undef, gen_dfa_actions \@active_nfa_edges, \%prio];
+                remove_from_set(\@active_nfa_edges, $right_nfa_edges);
+                $prev = $p + 1;
+
+            } elsif (defined $right_nfa_edges) {
+                push @dfa_edges, [$prev, $p, undef, gen_dfa_actions \@active_nfa_edges, \%prio];
+                remove_from_set(\@active_nfa_edges, $right_nfa_edges);
+                $prev = $p + 1;
+
+            } elsif (defined $left_nfa_edges) {
+                if ($prev <= $p - 1) {
+                    push @dfa_edges, [$prev, $p - 1, undef, gen_dfa_actions \@active_nfa_edges, \%prio];
+                }
+                add_to_set(\@active_nfa_edges, $left_nfa_edges);
+                $prev = $p;
             }
         }
     }
