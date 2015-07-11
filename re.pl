@@ -20,6 +20,7 @@ sub is_node ($);
 sub opcode ($);
 sub gen_dfa_edges ($$$$$);
 sub gen_dfa ($);
+sub gen_dfa_actions ($$);
 sub draw_dfa ($);
 sub escape_range ($$);
 sub gen_dfa_hash_key ($);
@@ -500,8 +501,7 @@ sub gen_dfa_edges ($$$$$) {
             my @saved = @active_nfa_edges;
             if (remove_from_set(\@active_nfa_edges, $right_nfa_edges)) {
                 #warn "HERE right $p (prev $prev)";
-                push @dfa_edges, [$prev, $p, undef,
-                    [sort { $prio{$a} <=> $prio{$b} } @saved]];
+                push @dfa_edges, [$prev, $p, undef, gen_dfa_actions \@saved, \%prio];
                 if (@active_nfa_edges) {
                     $prev = $p + 1;
                 }
@@ -515,15 +515,14 @@ sub gen_dfa_edges ($$$$$) {
             if (defined $prev) {
                 #warn "HERE left $p (prev $prev)";
                 if ($prev <= $p - 1) {
-                    push @dfa_edges, [$prev, $p - 1, undef,
-                        [sort { $prio{$a} <=> $prio{$b} } @active_nfa_edges]];
+                    push @dfa_edges,
+                        [$prev, $p - 1, undef, gen_dfa_actions \@active_nfa_edges, \%prio];
                 }
             }
             add_to_set(\@active_nfa_edges, $left_nfa_edges);
             $prev = $p;
             if ($singular) {
-                push @dfa_edges, [$prev, $p, undef,
-                    [sort { $prio{$a} <=> $prio{$b} } @active_nfa_edges]];
+                push @dfa_edges, [$prev, $p, undef, gen_dfa_actions \@active_nfa_edges, \%prio];
                 remove_from_set(\@active_nfa_edges, $right_nfa_edges);
                 $prev++;
             }
@@ -578,6 +577,25 @@ sub gen_dfa_edges ($$$$$) {
 
     #warn "DFA edges: ", Dumper(\@dfa_edges);
     return \@dfa_edges;
+}
+
+sub gen_dfa_actions ($$) {
+    my ($list, $prio) = @_;
+    my @edges = sort { $prio->{$a} <=> $prio->{$b} } @$list;
+    #return \@edges;
+    my %visited;
+    my $i = 0;
+    my @ret;
+    for my $e (@edges) {
+        my $last = $e->[-1];
+        if ($visited{$last}) {
+            next;
+        }
+        $visited{$last} = 1;
+        push @ret, $e;
+        $i++;
+    }
+    return \@ret;
 }
 
 sub gen_dfa_hash_key ($) {
