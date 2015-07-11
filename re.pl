@@ -27,11 +27,14 @@ sub add_to_set ($$);
 sub remove_from_set ($$);
 sub gen_dfa_node_label ($);
 sub gen_dfa_edge_label ($);
+sub gen_perl_from_dfa ($);
 
 $Data::Dumper::Terse = 1;
 
 my $re = shift
     or die "No regex specified.\n";
+
+my $subject = shift;
 
 my @cmd = ("./sregex-cli", $re);
 run3 \@cmd, undef, \(my $res), \(my $err);
@@ -129,6 +132,8 @@ if ($big) {
     #$edge_attr->{len} = 1.4;
 }
 
+my %nfa_paths;
+
 my $nfa = gen_nfa();
 #warn Dumper($nfa);
 draw_nfa($nfa);
@@ -136,6 +141,34 @@ draw_nfa($nfa);
 my $dfa = gen_dfa($nfa);
 #warn Dumper($dfa);
 draw_dfa($dfa);
+
+my $perl = gen_perl_from_dfa($dfa);
+print $perl;
+my $matcher = eval $perl;
+if ($@) {
+    die "failed to eval perl code: $@";
+}
+
+if (defined $subject) {
+    my $res = $matcher->($subject);
+    if (!defined $res) {
+        print "no match.\n";
+    } else {
+        print "matched: ";
+        my @bits;
+        for (my $i = 0; $i < @$res; $i += 2) {
+            my ($a, $b) = ($res->[$i], $res->[$i + 1]);
+            if (!defined $a) {
+                $a = -1;
+            }
+            if (!defined $b) {
+                $b = -1;
+            }
+            push @bits, "($a, $b)";
+        }
+        print join("", @bits) . "\n";
+    }
+}
 
 sub gen_nfa () {
     my @nodes;
@@ -247,6 +280,11 @@ sub add_nfa_edges ($$$$) {
     push @$to_nodes, $idx;
 
     my $edge = $to_nodes;
+    {
+        my $key = $from_node->{idx} . "-" . $edge->[0];
+        #warn $key;
+        $nfa_paths{$key} = 1;
+    }
     push @{ $from_node->{edges} }, $edge;
 }
 
@@ -345,6 +383,7 @@ sub gen_dfa ($) {
         edges => undef,
         idx => 0,
         start => 1,
+        actions => [[0]],
     };
     my @dfa_nodes = ($dfa_node);
     my %dfa_node_hash;
@@ -365,10 +404,31 @@ sub gen_dfa ($) {
         # de-duplicate elements in @all_nfa_edges?
         my $dfa_edges = gen_dfa_edges(\@dfa_nodes, \%dfa_node_hash, \@all_nfa_edges, $nfa, \$idx);
         $dfa_node->{edges} = $dfa_edges;
-        if (@$dfa_edges == 1 && !defined $dfa_edges->[0][0]) {
-            $dfa_edges->[0][0] = 0;
-            $dfa_edges->[0][1] = 255;
+
+        warn "DFA node ", gen_dfa_node_label($dfa_node), "\n";
+        for my $dfa_edge (@$dfa_edges) {
+            my $target = $dfa_edge->[-1];
+            warn " to DFA node ", gen_dfa_node_label($target), "\n";
+            my $from_actions = $dfa_node->{actions};
+            my $to_actions = $target->{actions};
+            my @paths;
+            my $row1 = 0;
+            for my $e1 (@$from_actions) {
+                my $row2 = 0;
+                for my $e2 (@$to_actions) {
+                    my ($a, $b) = ($e1->[-1], $e2->[0]);
+                    my $key = "$a-$b";
+                    if ($nfa_paths{$key}) {
+                        push @paths, [$row1, $row2];
+                        warn "    path: $row1 -> $row2\n";
+                    }
+                    $row2++;
+                }
+                $row1++;
+            }
+            $dfa_edge->[-2] = \@paths;
         }
+
         $i++;
     }
 
@@ -440,7 +500,7 @@ sub gen_dfa_edges ($$$$$) {
             my @saved = @active_nfa_edges;
             if (remove_from_set(\@active_nfa_edges, $right_nfa_edges)) {
                 #warn "HERE right $p (prev $prev)";
-                push @dfa_edges, [$prev, $p,
+                push @dfa_edges, [$prev, $p, undef,
                     [sort { $prio{$a} <=> $prio{$b} } @saved]];
                 if (@active_nfa_edges) {
                     $prev = $p + 1;
@@ -455,14 +515,14 @@ sub gen_dfa_edges ($$$$$) {
             if (defined $prev) {
                 #warn "HERE left $p (prev $prev)";
                 if ($prev <= $p - 1) {
-                    push @dfa_edges, [$prev, $p - 1,
+                    push @dfa_edges, [$prev, $p - 1, undef,
                         [sort { $prio{$a} <=> $prio{$b} } @active_nfa_edges]];
                 }
             }
             add_to_set(\@active_nfa_edges, $left_nfa_edges);
             $prev = $p;
             if ($singular) {
-                push @dfa_edges, [$prev, $p,
+                push @dfa_edges, [$prev, $p, undef,
                     [sort { $prio{$a} <=> $prio{$b} } @active_nfa_edges]];
                 remove_from_set(\@active_nfa_edges, $right_nfa_edges);
                 $prev++;
@@ -471,7 +531,7 @@ sub gen_dfa_edges ($$$$$) {
     }
 
     if (defined $accept_edge) {
-        push @dfa_edges, [undef, undef, [$accept_edge]];
+        unshift @dfa_edges, [undef, undef, undef, [$accept_edge]];
     }
 
     my %targets;
@@ -483,7 +543,8 @@ sub gen_dfa_edges ($$$$$) {
         my $old_edge = $targets{$key};
         if (defined $old_edge) {
             pop @$dfa_edge;
-            splice @$old_edge, -1, 0, @$dfa_edge;
+            pop @$dfa_edge;
+            splice @$old_edge, -2, 0, @$dfa_edge;
             $dfa_edge = undef;
             next;
         }
@@ -599,6 +660,8 @@ sub draw_dfa ($) {
 sub gen_dfa_edge_label ($) {
     my ($edge) = @_;
     my @bits = @$edge;
+    #warn "range: ", Dumper(\@bits);
+    pop @bits;
     pop @bits;
     #warn "range size: ", scalar @bits;
     return escape_range(\@bits, 0);
@@ -606,6 +669,9 @@ sub gen_dfa_edge_label ($) {
 
 sub gen_dfa_node_label ($) {
     my ($node) = @_;
+    if ($node->{start}) {
+        return "0";
+    }
     my @lines;
     for my $nfa_edge (@{ $node->{actions} }) {
         push @lines, join ",", @$nfa_edge;
@@ -624,16 +690,14 @@ sub escape_range ($$) {
                 if ($range->[0] == $range->[1]) {
                     return "'" . escape_char($range->[0]) . "'";
                 }
-                if ($range->[0] == 0 && $range->[1] == 255) {
-                    return "any";
-                }
             } else {
                 # epsilon edge to an "accept" state
-                return "else";
+                return "ɛ";
             }
         }
         $s = "[";
     }
+    #warn "range: ", Dumper($range);
     for (my $i = 0; $i < @$range; $i += 2) {
         my $a = $range->[$i];
         my $b = $range->[$i + 1];
@@ -644,4 +708,175 @@ sub escape_range ($$) {
         }
     }
     $s .= "]";
+}
+
+sub gen_perl_from_dfa ($) {
+    my ($dfa) = @_;
+
+    my $src = <<'_EOC_';
+sub {
+    my $s = shift;
+    my @b = map { ord } split //, $s;
+    my $c;
+    my $i = 0;
+    my $matched;
+_EOC_
+
+    my $max_threads = 0;
+    for my $node (@$dfa) {
+        my $n = @{ $node->{actions} };
+        if ($n > $max_threads) {
+            $max_threads = $n;
+        }
+    }
+
+    my @vars;
+    for (my $i = 0; $i < $max_threads; $i++) {
+        push @vars, "\$caps$i";
+    }
+    $src .= "    my (" . join(", ", @vars) . ") = ("
+            . join(", ", map { "[]" } 1..$max_threads) . ");\n";
+
+    for my $node (@$dfa) {
+        my $idx = $node->{idx};
+        my $label = gen_dfa_node_label($node);
+        $src .= <<_EOC_;
+st$idx:  # DFA node $label
+_EOC_
+
+        if ($node->{accept}) {
+           $src .= <<'_EOC_';
+    return $matched;
+_EOC_
+            next;
+        }
+
+        $src .= <<"_EOC_";
+    \$c = \$b[\$i++];
+_EOC_
+
+        my $first_time = 1;
+        my $edges = $node->{edges};
+        my $seen_accept;
+        for my $edge (@$edges) {
+            my @bits = @$edge;
+            my $target = pop @bits;
+            my $target_actions = $target->{actions};
+            my $maps = pop @bits;
+            my $to_accept;
+
+            my @cond;
+            if (@bits == 2 && !defined $bits[0]) {
+                # found ɛ edge to an accept state
+                $to_accept = 1;
+                $seen_accept = 1;
+            } else {
+                for (my $i = 0; $i < @bits; $i += 2) {
+                    my ($a, $b) = ($bits[$i], $bits[$i + 1]);
+                    if ($a == $b) {
+                        push @cond, "\$c == $a";
+                    } else {
+                        push @cond, "\$c >= $a && \$c <= $b";
+                    }
+                }
+            }
+
+            if ($first_time) {
+                undef $first_time;
+                if (!$seen_accept) {
+                    $src .= <<_EOC_;
+    if (!defined \$c) {
+        goto st${idx}_else;
+    }
+_EOC_
+                }
+            }
+            my $indent = " " x 4;
+
+            if (@cond) {
+                my $cond;
+                if (@cond == 1) {
+                    $cond = $cond[0];
+                } else {
+                    $cond = join " || ", map { "($_)" } @cond;
+                }
+                $src .= <<_EOC_;
+    if ($cond) {
+_EOC_
+                $indent x= 2;
+            }
+
+            my (@from_vars, @to_vars, @stores);
+            for my $map (@$maps) {
+                my ($from_row, $to_row) = @$map;
+                if ($to_accept) {
+                    push @from_vars, "\$caps$from_row";
+                    push @to_vars, "\$matched";
+
+                } elsif ($from_row != $to_row) {
+                    push @from_vars, "\$caps$from_row";
+                    push @to_vars, "\$caps$to_row";
+                }
+                my $nfa_edge = $target_actions->[$to_row];
+                for my $pc (@$nfa_edge) {
+                    my $bc = $bytecodes[$pc];
+                    my $bcname = opcode($bc);
+                    if ($bcname eq 'save') {
+                        my $id = $bc->[1];
+                        if ($to_accept) {
+                            push @stores, "\$matched->\[$id] = \$i - 1;";
+                        } else {
+                            push @stores, "\$caps$to_row->\[$id] = \$i - 1;";
+                        }
+                    } elsif ($bcname eq 'assert') {
+                        die "TODO: assertions";
+                    }
+                }
+            }
+
+            if (@from_vars) {
+                if (@from_vars > 1) {
+                    $src .= $indent . "(" . join(", ", @to_vars) . ") = ("
+                            . join(", ", map { "[\@$_]" } @from_vars) . ");\n";
+                } else {
+                    $src .= $indent . $to_vars[0] . " = [\@" . $from_vars[0] . "];\n";
+                }
+            }
+
+            if (@stores) {
+                $src .= $indent . join("\n$indent", @stores) . "\n";
+            }
+
+            my $to = $target->{idx};
+            if (!$to_accept) {
+                $src .= $indent . "goto st$to;\n";
+            }
+
+            if (@cond) {
+                $src .= "    }\n";
+            }
+
+            if ($to_accept) {
+                $src .= <<_EOC_;
+    if (defined \$c) {
+_EOC_
+            }
+        }
+
+        if ($seen_accept) {
+            $src .= <<_EOC_;
+    }
+_EOC_
+        }
+
+        $src .= <<_EOC_;
+st${idx}_else:
+    return \$matched;  # fallback
+_EOC_
+    }
+
+    $src .= <<_EOC_;
+}
+_EOC_
+    return $src;
 }
