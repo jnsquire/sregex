@@ -9,6 +9,7 @@ use GraphViz;
 use List::MoreUtils qw( uniq firstidx );
 use List::Util qw( first max );
 use Carp qw( croak carp );
+use Getopt::Long qw( GetOptions );
 
 sub add_nfa_edges ($$$$);
 sub gen_nfa_edge_label ($);
@@ -30,13 +31,46 @@ sub gen_dfa_node_label ($);
 sub gen_dfa_edge_label ($);
 sub gen_perl_from_dfa ($);
 sub canon_range ($);
+sub usage ($);
+
+GetOptions("help|h",        \(my $help),
+           "stdin",         \(my $stdin))
+   or die usage(1);
+
+if ($help) {
+    usage(0);
+}
 
 $Data::Dumper::Terse = 1;
 
-my $re = shift
-    or die "No regex specified.\n";
+my $re = shift;
+if (!defined $re) {
+    warn "No regex specified.\n";
+    usage(1);
+}
 
-my $subject = shift;
+my $subject;
+if ($stdin) {
+    my $first = <STDIN>;
+    if ($first =~ s/^(\d+)$//s) {
+        my $len = $1;
+        if (!defined read(STDIN, $subject, $len)) {
+            die "failed to read stdin: $!\n";
+        }
+
+    } else {
+        die "the stdin output must come with a length prefix line but got: $first\n";
+    }
+
+} else {
+    $subject = shift;
+    if (!defined $subject) {
+        warn "No subject nor --stdin specified.\n";
+        usage(1);
+    }
+}
+
+#die "subject: $subject";
 
 my @cmd = ("./sregex-cli", $re);
 run3 \@cmd, undef, \(my $res), \(my $err);
@@ -151,7 +185,7 @@ if ($@) {
     die "failed to eval perl code: $@";
 }
 
-if (defined $subject) {
+{
     my $res = $matcher->($subject);
     if (!defined $res) {
         print "no match.\n";
@@ -168,7 +202,7 @@ if (defined $subject) {
             }
             push @bits, "($a, $b)";
         }
-        print join("", @bits) . "\n";
+        print join(" ", @bits) . "\n";
     }
 }
 
@@ -485,17 +519,24 @@ sub gen_dfa_edges ($$$$$) {
             #canon_range(\@args);
             #warn "args: ", Dumper(\@args);
             my $from = 0;
+            my $found = 0;
             for (my $i = 0; $i < @args; $i += 2) {
                 my ($a, $b)  = ($args[$i], $args[$i + 1]);
-                push @endpoints, $a;
-                add_to_hash(\%left_end_hash, $from, $nfa_edge);
-                add_to_hash(\%right_end_hash, $a, $nfa_edge);
-                $from = $b;
+                if ($from <= $a - 1) {
+                    push @endpoints, $from;
+                    push @endpoints, $a - 1;
+                    add_to_hash(\%left_end_hash, $from, $nfa_edge);
+                    add_to_hash(\%right_end_hash, $a - 1, $nfa_edge);
+                }
+                $from = $b + 1;
+                $found++;
             }
-            push @endpoints, $from;
-            push @endpoints, 255;
-            add_to_hash(\%left_end_hash, $from, $nfa_edge);
-            add_to_hash(\%right_end_hash, 255, $nfa_edge);
+            if ($found && $from <= 255) {
+                push @endpoints, $from;
+                push @endpoints, 255;
+                add_to_hash(\%left_end_hash, $from, $nfa_edge);
+                add_to_hash(\%right_end_hash, 255, $nfa_edge);
+            }
         } elsif ($opcode eq 'match') {
             $accept_edge = $nfa_edge;
             last;
@@ -513,7 +554,10 @@ sub gen_dfa_edges ($$$$$) {
             die if defined $prev;
             $prev = $p;
             my $left_nfa_edges = $left_end_hash{$p};
-            die unless defined $left_nfa_edges;
+            if (!defined $left_nfa_edges) {
+                warn $p;
+                die;
+            }
             add_to_set(\@active_nfa_edges, $left_nfa_edges);
 
             my $right_nfa_edges = $right_end_hash{$p};
@@ -523,6 +567,8 @@ sub gen_dfa_edges ($$$$$) {
                 remove_from_set(\@active_nfa_edges, $right_nfa_edges);
                 if (@active_nfa_edges) {
                     $prev++;
+                } else {
+                    undef $prev;
                 }
             }
 
@@ -540,12 +586,20 @@ sub gen_dfa_edges ($$$$$) {
                 add_to_set(\@active_nfa_edges, $left_nfa_edges);
                 push @dfa_edges, [$p, $p, undef, gen_dfa_actions \@active_nfa_edges, \%prio];
                 remove_from_set(\@active_nfa_edges, $right_nfa_edges);
-                $prev = $p + 1;
+                if (!@active_nfa_edges) {
+                    undef $prev;
+                } else {
+                    $prev = $p + 1;
+                }
 
             } elsif (defined $right_nfa_edges) {
                 push @dfa_edges, [$prev, $p, undef, gen_dfa_actions \@active_nfa_edges, \%prio];
                 remove_from_set(\@active_nfa_edges, $right_nfa_edges);
-                $prev = $p + 1;
+                if (!@active_nfa_edges) {
+                    undef $prev;
+                } else {
+                    $prev = $p + 1;
+                }
 
             } elsif (defined $left_nfa_edges) {
                 if ($prev <= $p - 1) {
@@ -965,4 +1019,19 @@ _EOC_
 }
 _EOC_
     return $src;
+}
+
+sub usage ($) {
+    my $rc = shift;
+    my $msg = <<"_EOC_";
+Usage:
+    re.pl <regex> <string>
+    re.pl --stdin <regex> < input-file
+_EOC_
+    if ($rc) {
+        warn $msg;
+        exit $rc;
+    }
+    print $msg;
+    exit 0;
 }
