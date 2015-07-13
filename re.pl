@@ -32,6 +32,7 @@ sub gen_dfa_edge_label ($);
 sub gen_perl_from_dfa ($);
 sub canon_range ($);
 sub usage ($);
+sub gen_dfa_edge ($$$$);
 
 GetOptions("help|h",        \(my $help),
            "stdin",         \(my $stdin))
@@ -288,8 +289,8 @@ sub add_nfa_edges ($$$$) {
         if ($opcode eq 'split') {
             my $y = $bc->[2];
             if (!$visited->{$y}) {
-                add_nfa_edges($from_node, $y, $visited, $to_nodes);
-                return;
+                local @_ = ($from_node, $y, $visited, $to_nodes);
+                goto \&add_nfa_edges;
             }
         }
         return;
@@ -298,8 +299,8 @@ sub add_nfa_edges ($$$$) {
     $visited->{$idx} = 1;
 
     if ($opcode eq 'jmp') {
-        add_nfa_edges($from_node, $bc->[1], $visited, $to_nodes);
-        return;
+        local @_ = ($from_node, $bc->[1], $visited, $to_nodes);
+        goto \&add_nfa_edges;
     }
 
     if ($opcode eq 'split') {
@@ -307,8 +308,8 @@ sub add_nfa_edges ($$$$) {
         my $y = $bc->[2];
         my $forked = $to_nodes ? [@$to_nodes] : undef;
         add_nfa_edges($from_node, $x, $visited, $to_nodes);
-        add_nfa_edges($from_node, $y, $visited, $forked);
-        return;
+        local @_ = ($from_node, $y, $visited, $forked);
+        goto \&add_nfa_edges;
     }
 
     if ($opcode eq 'save' or $opcode eq 'assert') {
@@ -317,8 +318,8 @@ sub add_nfa_edges ($$$$) {
             $to_nodes = [];
         }
         push @$to_nodes, $idx;
-        add_nfa_edges($from_node, $idx + 1, $visited, $to_nodes);
-        return;
+        local @_ = ($from_node, $idx + 1, $visited, $to_nodes);
+        goto \&add_nfa_edges;
     }
 
     if (!defined $to_nodes) {
@@ -484,7 +485,11 @@ sub gen_dfa ($) {
 
 sub gen_dfa_edges ($$$$$) {
     my ($dfa_nodes, $dfa_node_hash, $nfa_edges, $nfa, $idx_ref) = @_;
+
     my (%left_end_hash, %right_end_hash, %prio, @endpoints);
+
+    # process char ranges
+
     my $prio = 0;
     my $accept_edge;
     for my $nfa_edge (@$nfa_edges) {
@@ -548,6 +553,9 @@ sub gen_dfa_edges ($$$$$) {
     #warn "left endpoint hash: ", Dumper(\%left_end_hash);
     #warn "right endpoint hash: ", Dumper(\%right_end_hash);
     #warn "endpoints: ", Dumper(\@endpoints);
+
+    # split and merge char ranges to form DFA edges
+
     my (@active_nfa_edges, @dfa_edges, $prev);
     for my $p (@endpoints) {
         if (!@active_nfa_edges) {
@@ -563,7 +571,7 @@ sub gen_dfa_edges ($$$$$) {
             my $right_nfa_edges = $right_end_hash{$p};
             if (defined $right_nfa_edges) {
                 # singular
-                push @dfa_edges, [$prev, $p, undef, gen_dfa_actions \@active_nfa_edges, \%prio];
+                push @dfa_edges, gen_dfa_edge($prev, $p, \@active_nfa_edges, \%prio);
                 remove_from_set(\@active_nfa_edges, $right_nfa_edges);
                 if (@active_nfa_edges) {
                     $prev++;
@@ -581,10 +589,11 @@ sub gen_dfa_edges ($$$$$) {
 
             if (defined $right_nfa_edges && defined $left_nfa_edges) {
                 if ($prev <= $p - 1) {
-                    push @dfa_edges, [$prev, $p - 1, undef, gen_dfa_actions \@active_nfa_edges, \%prio];
+                    push @dfa_edges, gen_dfa_edge($prev, $p - 1,
+                                                      \@active_nfa_edges, \%prio);
                 }
                 add_to_set(\@active_nfa_edges, $left_nfa_edges);
-                push @dfa_edges, [$p, $p, undef, gen_dfa_actions \@active_nfa_edges, \%prio];
+                push @dfa_edges, gen_dfa_edge($p, $p, \@active_nfa_edges, \%prio);
                 remove_from_set(\@active_nfa_edges, $right_nfa_edges);
                 if (!@active_nfa_edges) {
                     undef $prev;
@@ -593,7 +602,8 @@ sub gen_dfa_edges ($$$$$) {
                 }
 
             } elsif (defined $right_nfa_edges) {
-                push @dfa_edges, [$prev, $p, undef, gen_dfa_actions \@active_nfa_edges, \%prio];
+                push @dfa_edges, gen_dfa_edge($prev, $p, \@active_nfa_edges,
+                                                  \%prio);
                 remove_from_set(\@active_nfa_edges, $right_nfa_edges);
                 if (!@active_nfa_edges) {
                     undef $prev;
@@ -603,13 +613,16 @@ sub gen_dfa_edges ($$$$$) {
 
             } elsif (defined $left_nfa_edges) {
                 if ($prev <= $p - 1) {
-                    push @dfa_edges, [$prev, $p - 1, undef, gen_dfa_actions \@active_nfa_edges, \%prio];
+                    push @dfa_edges, gen_dfa_edge($prev, $p - 1,
+                                                      \@active_nfa_edges, \%prio);
                 }
                 add_to_set(\@active_nfa_edges, $left_nfa_edges);
                 $prev = $p;
             }
         }
     }
+
+    # resolve DFA edge targets
 
     if (defined $accept_edge) {
         unshift @dfa_edges, [undef, undef, undef, [$accept_edge]];
@@ -661,6 +674,12 @@ sub gen_dfa_edges ($$$$$) {
     return \@dfa_edges;
 }
 
+sub gen_dfa_edge ($$$$) {
+    my ($a, $b, $nfa_edges, $nfa_edge_prio) = @_;
+
+    return [$a, $b, undef, gen_dfa_actions $nfa_edges, $nfa_edge_prio];
+}
+
 sub canon_range ($) {
     my ($args) = @_;
     my (%left_end_hash, %right_end_hash, @endpoints);
@@ -702,8 +721,8 @@ sub canon_range ($) {
 }
 
 sub gen_dfa_actions ($$) {
-    my ($list, $prio) = @_;
-    my @edges = sort { $prio->{$a} <=> $prio->{$b} } @$list;
+    my ($nfa_edges, $nfa_edge_prio) = @_;
+    my @edges = sort { $nfa_edge_prio->{$a} <=> $nfa_edge_prio->{$b} } @$nfa_edges;
     #return \@edges;
     my %visited;
     my $i = 0;
