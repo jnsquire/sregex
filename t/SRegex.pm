@@ -12,6 +12,7 @@ use Test::LongString;
 sub run_test ($);
 sub parse_res ($);
 sub fmt_cap ($$);
+sub parse_perl_dfa_res ($$);
 
 
 our @EXPORT = qw( run_tests );
@@ -239,6 +240,18 @@ sub run_test ($) {
                     is($splitted_pike_temp_cap, $block->temp_cap, "$name - splitted pike vm temporary capture ok");
                 }
 
+                if (!@opts) {
+                    my $res = parse_perl_dfa_res($re, $stdin);
+
+                    if (defined $block->no_match) {
+                        is($res, 0, "$name - perl dfa vm should not match");
+                    } else {
+                        isnt($res, 0, "$name - perl dfa vm should match");
+                    }
+
+                    is($res, $expected_cap, "$name - perl dfa vm capture ok");
+                }
+
             } elsif ($s =~ m/$prefix$re/sm) {
                 my $expected_cap = fmt_cap(\@-, \@+);
 
@@ -268,6 +281,18 @@ sub run_test ($) {
                     is($splitted_pike_temp_cap, $block->temp_cap, "$name - splitted pike vm temporary capture ok");
                 }
 
+                if (!@opts) {
+                    my $res = parse_perl_dfa_res($re, $stdin);
+
+                    if (defined $block->no_match) {
+                        is($res, 0, "$name - perl dfa vm should not match");
+                    } else {
+                        isnt($res, 0, "$name - perl dfa vm should match");
+                    }
+
+                    is($res, $expected_cap, "$name - perl dfa vm capture ok");
+                }
+
             } else {
                 ok(!$thompson_match, "$name - thompson vm should not match");
 
@@ -289,6 +314,32 @@ sub run_test ($) {
     }
 }
 
+sub parse_perl_dfa_res ($$) {
+    my ($re, $data) = @_;
+    #warn "data: $data";
+    my ($res, $err);
+    #warn @opts;
+    my @cmd = ("./re.pl", "--stdin", $re);
+    #warn "command: @cmd";
+
+    run3 \@cmd, \$data, \$res, \$err;
+    if ($err) {
+        warn $err;
+    }
+    my @lines = split /\n/, $res;
+    #warn scalar @lines;
+    my $last = pop @lines;
+    #warn "last: $last";
+    if ($last =~ /^nomatch/) {
+        return 0;
+    }
+    if ($last =~ /^matched: (.+)/) {
+        return $1;
+    }
+    #warn $res;
+    #warn "Bad perl script output: $last";
+    return undef;
+}
 
 sub parse_res ($) {
     my $res = shift;
