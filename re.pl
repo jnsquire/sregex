@@ -21,7 +21,8 @@ sub is_node ($);
 sub opcode ($);
 sub gen_dfa_edges ($$$$$$);
 sub gen_dfa ($);
-sub gen_dfa_actions ($$);
+sub dedup_nfa_edges ($);
+sub reorder_nfa_edges ($$);
 sub draw_dfa ($);
 sub escape_range ($$);
 sub gen_dfa_hash_key ($);
@@ -444,7 +445,7 @@ sub gen_dfa ($) {
         edges => undef,
         idx => 0,
         start => 1,
-        actions => [[0]],
+        states => [0],
     };
     my @dfa_nodes = ($dfa_node);
     my %dfa_node_hash;
@@ -459,14 +460,14 @@ sub gen_dfa ($) {
         if (!defined $nfa_nodes) {
             # must be of the special assert node type
             my $assert_info = $dfa_node->{assert_info};
-            my $actions = $dfa_node->{actions};
-            die unless defined $assert_info && defined $actions;
-            $dfa_edges = gen_dfa_edges_for_asserts($dfa_node, $assert_info, $actions,
+            my $nfa_edges = $dfa_node->{nfa_edges};
+            #die unless defined $assert_info && defined $nfa_edges;
+            $dfa_edges = gen_dfa_edges_for_asserts($dfa_node, $assert_info, $nfa_edges,
                                                    \@dfa_nodes, \%dfa_node_hash, \$idx);
             $dfa_node->{edges} = $dfa_edges;
             if ($dfa_node->{accept}) {
-                for my $e (@$dfa_edges) {
-                    $e->[-1]{accept} = 1;
+                for my $dfa_edge (@$dfa_edges) {
+                    $dfa_edge->{target}{accept} = 1;
                 }
                 delete $dfa_node->{accept};
             }
@@ -494,30 +495,25 @@ sub gen_dfa ($) {
 
         #warn "DFA node ", gen_dfa_node_label($dfa_node), "\n";
         for my $dfa_edge (@$dfa_edges) {
-            my $target = $dfa_edge->[-1];
-            #warn " to DFA node ", gen_dfa_node_label($target), "\n";
-            my $from_actions = $dfa_node->{actions};
-            my $to_actions = $target->{actions};
-            my @paths;
+            my $nfa_edges = $dfa_edge->{nfa_edges};
+            my $src_states = $dfa_node->{states};
+            my @mappings;
             my %assigned;
-            my $row1 = 0;
-            for my $e1 (@$from_actions) {
-                my $row2 = 0;
-                for my $e2 (@$to_actions) {
-                    my ($a, $b) = ($e1->[-1], $e2->[0]);
-                    my $key = "$a-$b";
-                    if (!$assigned{$row2} && $nfa_paths{$key}) {
-                        push @paths, [$row1, $row2];
-                        #if ($dfa_edge->[0] == 98 && $dfa_node->{idx} == 3) {
-                            #warn "    path: $row1 -> $row2\n";
-                        #}
-                        $assigned{$row2} = 1;
+            my $from_row = 0;
+            for my $src_state (@$src_states) {
+                my $to_row = 0;
+                for my $nfa_edge (@$nfa_edges) {
+                    my $to_pc = $nfa_edge->[0];
+                    my $key = "$src_state-$to_pc";
+                    if (!$assigned{$to_row} && $nfa_paths{$key}) {
+                        push @mappings, [$from_row, $to_row];
+                        $assigned{$to_row} = 1;
                     }
-                    $row2++;
+                    $to_row++;
                 }
-                $row1++;
+                $from_row++;
             }
-            $dfa_edge->[-2] = \@paths;
+            $dfa_edge->{capture_mappings} = \@mappings;
         }
 
         $i++;
@@ -556,10 +552,10 @@ sub gen_dfa_edges_for_asserts ($$$$$$) {
             # not possible
             next;
         }
-        my $assert_results = {
-            encoding => $comb_encoding,
+        my $dfa_edge = {
+            assert_settings => $comb_encoding,
+            nfa_edges => reorder_nfa_edges(\@filtered_nfa_edges, undef),
         };
-        my $dfa_edge = [$assert_results, undef, gen_dfa_actions \@filtered_nfa_edges, undef];
         push @dfa_edges, $dfa_edge;
     }
 
@@ -759,43 +755,58 @@ sub gen_dfa_edges ($$$$$$) {
 
 sub resolve_dfa_edge ($$$$$$$$) {
     my ($from_node, $dfa_edge, $accept_edges, $targets, $dfa_nodes, $dfa_node_hash, $idx_ref, $no_assert_check) = @_;
-    my $target = $dfa_edge->[-1];
+    my $nfa_edges = $dfa_edge->{nfa_edges};
     my $assert_info;
     if (!$no_assert_check) {
-        $assert_info = resolve_asserts($target);
+        $assert_info = resolve_asserts($nfa_edges);
         #warn "assert info: ", Dumper($assert_info);
     }
-    #warn "DFA edge target: ", Dumper($target);
+    #warn "DFA edge target: ", Dumper($nfa_edges);
+
+    if (!defined $assert_info) {
+        $nfa_edges = dedup_nfa_edges($nfa_edges);
+        $dfa_edge->{nfa_edges} = $nfa_edges;
+    }
+
+    my @states;
+    for my $nfa_edge (@$nfa_edges) {
+        push @states, $nfa_edge->[-1];
+    }
+
     my ($key, $target_dfa_node);
     if (!defined $assert_info) {
-        $key = gen_dfa_hash_key($target);
+        $key = gen_dfa_hash_key(\@states);
         #warn "dfa state key: ", $key;
         my $old_edge = $targets->{$key};
         if (defined $old_edge) {
-            pop @$dfa_edge;
-            pop @$dfa_edge;
-            splice @$old_edge, -2, 0, @$dfa_edge;
-            return undef;
+            my $old_ranges = $old_edge->{char_ranges};
+            if (defined $old_ranges) {
+                my $cur_ranges = $dfa_edge->{char_ranges};
+                #warn "old_ranges: $old_ranges; cur_ranges: $cur_ranges";
+                push @$old_ranges, @$cur_ranges;
+                return undef;
+            }
         }
         $targets->{$key} = $dfa_edge;
         #warn "looking up key $key";
         $target_dfa_node = $dfa_node_hash->{$key};
         if (defined $target_dfa_node) {
-            $dfa_edge->[-1] = $target_dfa_node;
+            $dfa_edge->{target} = $target_dfa_node;
             return $dfa_edge;
         }
     }
 
     my $is_accept;
-    if ($accept_edges && @$accept_edges && @$target == @$accept_edges
-        && "@$target" eq "@$accept_edges")
+    if ($accept_edges && @$accept_edges && @$nfa_edges == @$accept_edges
+        && "@$nfa_edges" eq "@$accept_edges")
     {
         $is_accept = 1;
     }
+
     my $nfa_nodes;
     if (!defined $assert_info) {
         $nfa_nodes = [];
-        for my $nfa_edge (@$target) {
+        for my $nfa_edge (@$nfa_edges) {
             my $nfa_idx = $nfa_edge->[-1];
             my $nfa_node = first { $_->{idx} eq $nfa_idx } @$nfa;
             push @$nfa_nodes, $nfa_node;
@@ -804,10 +815,11 @@ sub resolve_dfa_edge ($$$$$$$$) {
     $target_dfa_node = {
         defined $assert_info
             ? (assert_info => $assert_info,
-               orig_source => $from_node->{idx})
+               orig_source => $from_node->{idx},
+               nfa_edges => $nfa_edges)
             : (nfa_nodes => $nfa_nodes),
         edges => undef,
-        actions => $target,
+        states => \@states,
         idx => $$idx_ref++,
         $is_accept ? (accept => 1) : (),
     };
@@ -815,16 +827,22 @@ sub resolve_dfa_edge ($$$$$$$$) {
     if (!defined $assert_info) {
         $dfa_node_hash->{$key} = $target_dfa_node;
     }
-    $dfa_edge->[-1] = $target_dfa_node;
+    $dfa_edge->{target} = $target_dfa_node;
     return $dfa_edge;
 }
 
 sub gen_dfa_edge ($$$$) {
     my ($a, $b, $nfa_edges, $nfa_edge_prio) = @_;
     if (defined $a) {
-        return [$a, $b, undef, gen_dfa_actions $nfa_edges, $nfa_edge_prio];
+        return {
+            char_ranges => [$a, $b],
+            nfa_edges => reorder_nfa_edges($nfa_edges, $nfa_edge_prio),
+        };
     }
-    return [undef, undef, undef, $nfa_edges];
+    return {
+        to_accept => 1,
+        nfa_edges => $nfa_edges,
+    };
 }
 
 sub resolve_asserts ($) {
@@ -913,15 +931,19 @@ sub canon_range ($) {
     @$args = @new;
 }
 
-sub gen_dfa_actions ($$) {
+sub reorder_nfa_edges ($$) {
     my ($nfa_edges, $nfa_edge_prio) = @_;
     my @edges = defined $nfa_edge_prio
                 ?  sort { $nfa_edge_prio->{$a} <=> $nfa_edge_prio->{$b} } @$nfa_edges
                 : @$nfa_edges;
     return \@edges;
+}
+
+sub dedup_nfa_edges ($) {
+    my ($nfa_edges) = @_;
     my %visited;
     my @ret;
-    for my $e (@edges) {
+    for my $e (@$nfa_edges) {
         my $last = $e->[-1];
         if ($visited{$last}) {
             next;
@@ -933,13 +955,9 @@ sub gen_dfa_actions ($$) {
 }
 
 sub gen_dfa_hash_key ($) {
-    my ($nfa_edges) = @_;
+    my ($states) = @_;
     #carp "nfa edges: ", Dumper($nfa_edges);
-    my @bits;
-    for my $nfa_edge (@$nfa_edges) {
-        push @bits, join ",", @$nfa_edge;
-    }
-    return join "|", @bits;
+    join ",", @$states;
 }
 
 sub add_to_set ($$) {
@@ -1000,7 +1018,7 @@ sub draw_dfa ($) {
         my $from_idx = $node->{idx};
         for my $e (@{ $node->{edges} }) {
             my $label = gen_dfa_edge_label($node, $e);
-            my $to = $e->[-1];
+            my $to = $e->{target};
             my $to_idx = $to->{idx};
             $graph->add_edge("n$from_idx" => "n$to_idx", label => $label,
                              len => max(length($label) / 6, 1.7));
@@ -1012,22 +1030,16 @@ sub draw_dfa ($) {
 
 sub gen_dfa_edge_label ($$) {
     my ($from_node, $edge) = @_;
-    my @bits = @$edge;
-    #warn "range: ", Dumper(\@bits);
-    pop @bits;
-    pop @bits;
-    #warn scalar(@bits);
-    if (ref $bits[0]) {
+    my $assert_settings = $edge->{assert_settings};
+    if (defined $assert_settings) {
         # must be the assert results
-        my $assert_results = $bits[0];
-        my $enc = $assert_results->{encoding};
         my $assert_info = $from_node->{assert_info} or die;
         my $asserts = $assert_info->{asserts} or die;
         my @labels;
         for my $assert (sort keys %$asserts) {
             my $idx = $asserts->{$assert};
             (my $label = $assert) =~ s/\\/\\\\/g;
-            if (!($enc & (1 << $idx))) {
+            if (!($assert_settings & (1 << $idx))) {
                 $label = "!$label";
             }
             push @labels, $label;
@@ -1035,8 +1047,13 @@ sub gen_dfa_edge_label ($$) {
         #warn "labels: @labels";
         return join ",", @labels;
     }
+    if ($edge->{to_accept}) {
+        # epsilon edge to an "accept" state
+        return "ɛ";
+    }
+    my $ranges = $edge->{char_ranges};
     #warn "range size: ", scalar @bits;
-    return escape_range(\@bits, 0);
+    return escape_range($ranges, 0);
 }
 
 sub gen_dfa_node_label ($) {
@@ -1044,28 +1061,23 @@ sub gen_dfa_node_label ($) {
     if ($node->{start}) {
         return "0";
     }
-    my @lines;
-    for my $nfa_edge (@{ $node->{actions} }) {
-        push @lines, join ",", @$nfa_edge;
-    }
+    my @lines = (join ",", @{ $node->{states} });
     push @lines, "[" . $node->{idx} . "]";
     return join "\\n", @lines;
 }
 
 sub escape_range ($$) {
     my ($range, $negate) = @_;
+    if (!defined $range) {
+        croak;
+    }
     my $s;
     if ($negate) {
         $s = "[^";
     } else {
         if (@$range == 2) {
-            if (defined $range->[0]) {
-                if ($range->[0] == $range->[1]) {
-                    return "'" . escape_char($range->[0]) . "'";
-                }
-            } else {
-                # epsilon edge to an "accept" state
-                return "ɛ";
+            if ($range->[0] == $range->[1]) {
+                return "'" . escape_char($range->[0]) . "'";
             }
         }
         $s = "[";
@@ -1117,7 +1129,7 @@ _EOC_
 
     my $max_threads = 0;
     for my $node (@$dfa) {
-        my $n = @{ $node->{actions} };
+        my $n = @{ $node->{states} };
         if ($n > $max_threads) {
             $max_threads = $n;
         }
@@ -1140,7 +1152,7 @@ _EOC_
         #$src .= "    warn 'entering state $label';\n";
 
         if ($node->{accept}) {
-            $src .= "    return \$matched;\n";
+            $src .= "    return \$matched;  # accept state\n";
             next;
         }
 
@@ -1197,23 +1209,19 @@ sub gen_perl_for_dfa_edge ($$) {
     my ($edge, $level) = @_;
 
     my $src = '';
-    my $to_accept;
     my @indents = (" " x (4 * $level), " " x (4 * ($level + 1)));
     my $indent_idx = 0;
 
-    my @bits = @$edge;
-    my $target = pop @bits;
-    pop @bits;
+    my $ranges = $edge->{char_ranges};
+    my $target = $edge->{target};
+    my $to_accept = $edge->{to_accept};
+
+    #warn "to accept: $to_accept";
 
     my @cond;
-    if (@bits == 2 && !defined $bits[0]) {
-        # found ɛ edge to an accept state
-        $to_accept = 1;
-    } elsif (ref $bits[0]) {
-        die;
-    } else {
-        for (my $i = 0; $i < @bits; $i += 2) {
-            my ($a, $b) = ($bits[$i], $bits[$i + 1]);
+    if (defined $ranges) {
+        for (my $i = 0; $i < @$ranges; $i += 2) {
+            my ($a, $b) = ($ranges->[$i], $ranges->[$i + 1]);
             if ($a == $b) {
                 push @cond, "\$c == $a";
             } else {
@@ -1233,47 +1241,43 @@ sub gen_perl_for_dfa_edge ($$) {
         $indent_idx++;
     }
 
-    my $assert_eval_code = '';
     my $assert_info = $target->{assert_info};
     my $indent = $indents[$indent_idx];
     if (defined $assert_info) {
         my $asserts = $assert_info->{asserts};
-        $assert_eval_code = $indent . "\$asserts = 0;\n";
+        $src .= $indent . "\$asserts = 0;\n";
         for my $assert (sort keys %$asserts) {
             my $idx = $asserts->{$assert};
             if ($assert eq '^') {
-                $assert_eval_code .= $indent . '$asserts |= ($i == 1 || $i >= 2 && $b[$i - 2] == 10? 1 : 0) << '
+                $src .= $indent . '$asserts |= ($i == 1 || $i >= 2 && $b[$i - 2] == 10? 1 : 0) << '
                                    . $idx . ";\n";
             } elsif ($assert eq '$') {
-                $assert_eval_code .= $indent . '$asserts |= (!defined $c || $c == 10 ? 1 : 0) << '
+                $src .= $indent . '$asserts |= (!defined $c || $c == 10 ? 1 : 0) << '
                                    . $idx . ";\n";
             } elsif ($assert eq '\b') {
-                $assert_eval_code .= $indent . '$asserts |= (is_word_boundary($i >= 2 ? $b[$i - 2] : undef, $c) ? 1 : 0) << '
+                $src .= $indent . '$asserts |= (is_word_boundary($i >= 2 ? $b[$i - 2] : undef, $c) ? 1 : 0) << '
                                    . $idx . ";\n";
             } elsif ($assert eq '\B') {
-                $assert_eval_code .= $indent . '$asserts |= (is_word_boundary($i >= 2 ? $b[$i - 2] : undef, $c) ? 0 : 1) << '
+                $src .= $indent . '$asserts |= (is_word_boundary($i >= 2 ? $b[$i - 2] : undef, $c) ? 0 : 1) << '
                                    . $idx . ";\n";
             } elsif ($assert eq '\A') {
-                $assert_eval_code .= $indent . '$asserts |= ($i == 1 ? 1 : 0) << '
+                $src .= $indent . '$asserts |= ($i == 1 ? 1 : 0) << '
                                    . $idx . ";\n";
             } elsif ($assert eq '\z') {
-                $assert_eval_code .= $indent . '$asserts |= (!defined $c? 1 : 0) << '
+                $src .= $indent . '$asserts |= (!defined $c? 1 : 0) << '
                                    . $idx . ";\n";
             } else {
                 die "TODO";
             }
-            #$assert_eval_code .= $indent . "warn 'assertion $assert test result: ', \$asserts, \", idx = $idx, i = \$i, c = \$c\n\";\n";
+            #$src .= $indent . "warn 'assertion $assert test result: ', \$asserts, \", idx = $idx, i = \$i, c = \$c\n\";\n";
         }
-
-        $src .= $assert_eval_code;
 
         my $assert_edges = $target->{edges};
         for my $e (@$assert_edges) {
-            my $assert_res = $e->[0];
-            die unless ref $assert_res;
-            my $enc = $assert_res->{encoding};
-            my $target = $e->[-1];
-            $src .= $indent . "if (\$asserts == $enc) {\n";
+            my $assert_settings = $e->{assert_settings};
+            #die unless ref $assert_settings;
+            my $target = $e->{target};
+            $src .= $indent . "if (\$asserts == $assert_settings) {\n";
             my $indent2 = $indent . (" " x 4);
             if ($target->{accept}) {
                 $to_accept = 1;
@@ -1309,13 +1313,13 @@ sub gen_capture_handler_perl_code ($$$) {
     my ($edge, $to_accept, $indent) = @_;
 
     my $src = '';
-    my $target = $edge->[-1];
-    my $maps = $edge->[-2];
-    my $target_actions = $target->{actions};
+    my $target = $edge->{target};
+    my $mappings = $edge->{capture_mappings};
+    my $target_actions = $edge->{nfa_edges};
 
     my (@from_vars, @to_vars, @stores);
-    for my $map (@$maps) {
-        my ($from_row, $to_row) = @$map;
+    for my $mapping (@$mappings) {
+        my ($from_row, $to_row) = @$mapping;
         if ($to_accept) {
             push @from_vars, "\$caps$from_row";
             push @to_vars, "\$matched";
