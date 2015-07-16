@@ -129,6 +129,7 @@ my %cached_labels;
 my %escaped_range_chars = (
     "\t" => '\t',
     "\n" => '\n',
+    "\r" => '\r',
     " " => '\ ',
     "\e" => '\e',
     "\f" => '\f',
@@ -197,7 +198,7 @@ my $dfa = gen_dfa($nfa);
 
 #exit;
 my $perl = gen_perl_from_dfa($dfa);
-#print $perl;
+#warn $perl;
 #warn length $perl;
 #$begin = time;
 my $matcher = eval $perl;
@@ -445,6 +446,7 @@ sub escape_range_char ($) {
     my $c = chr($code);
     my $escaped = $escaped_range_chars{$c};
     if (defined $escaped) {
+        $escaped =~ s{\\}{\\\\}g;
         return $escaped;
     }
     if ($c =~ /[[:alnum:]]/) {
@@ -511,11 +513,12 @@ sub gen_dfa ($) {
                 my $prio;
                 if ($first->{to_accept}) {
                     my ($lo0, $hi0) = @{ $first->{prio_range} };
+                    #warn "DFA node: ", gen_dfa_node_label($dfa_node), "\n";
                     for (my $i = 1; $i < @$dfa_edges; $i++) {
                         my $dfa_edge = $dfa_edges->[$i];
                         my ($lo, $hi) = @{ $dfa_edge->{prio_range} };
                         my $label = gen_dfa_edge_label($dfa_node, $dfa_edge);
-                        #warn "DFA edge $label: comp $i vs 0: lo: $lo vs $lo0, hi: $hi vs $hi0";
+                        #warn "  DFA edge $label: comp $i vs 0: lo: $lo vs $lo0, hi: $hi vs $hi0";
                         #warn "$hi > $lo0";
                         if (prio_lower($hi, $lo0)) {
                             #warn "DFA edge hit: ", $label;
@@ -543,12 +546,14 @@ sub gen_dfa ($) {
             my @mappings;
             my %assigned;
             my $from_row = 0;
+            #warn "source state: ", join(",", @$src_states), " => ", gen_dfa_node_label($dfa_edge->{target}), "\n";
             for my $src_state (@$src_states) {
                 my $to_row = 0;
                 for my $nfa_edge (@$nfa_edges) {
                     my $to_pc = $nfa_edge->[0];
                     my $key = "$src_state-$to_pc";
                     if (!$assigned{$to_row} && $nfa_paths{$key}) {
+                        #warn "  mapping: $from_row => $to_row\n";
                         push @mappings, [$from_row, $to_row];
                         $assigned{$to_row} = 1;
                     }
@@ -1337,22 +1342,21 @@ sub gen_perl_for_dfa_edge ($$) {
             my $idx = $asserts->{$assert};
             if ($assert eq '^') {
                 $src .= $indent . '$asserts |= ($i == 1 || $i >= 2 && $b[$i - 2] == 10? 1 : 0) << '
-                                   . $idx . ";\n";
+                                   . "$idx;\n";
             } elsif ($assert eq '$') {
                 $src .= $indent . '$asserts |= (!defined $c || $c == 10 ? 1 : 0) << '
-                                   . $idx . ";\n";
+                                   . "$idx;\n";
             } elsif ($assert eq '\b') {
                 $src .= $indent . '$asserts |= (is_word_boundary($i >= 2 ? $b[$i - 2] : undef, $c) ? 1 : 0) << '
-                                   . $idx . ";\n";
+                                   . "$idx;\n";
             } elsif ($assert eq '\B') {
                 $src .= $indent . '$asserts |= (is_word_boundary($i >= 2 ? $b[$i - 2] : undef, $c) ? 0 : 1) << '
-                                   . $idx . ";\n";
+                                   . "$idx;\n";
             } elsif ($assert eq '\A') {
                 $src .= $indent . '$asserts |= ($i == 1 ? 1 : 0) << '
-                                   . $idx . ";\n";
+                                   . "$idx;\n";
             } elsif ($assert eq '\z') {
-                $src .= $indent . '$asserts |= (!defined $c? 1 : 0) << '
-                                   . $idx . ";\n";
+                $src .= $indent . '$asserts |= (!defined $c? 1 : 0) << ' . "$idx;\n";
             } else {
                 die "TODO";
             }
@@ -1360,16 +1364,16 @@ sub gen_perl_for_dfa_edge ($$) {
         }
 
         my $assert_edges = $target->{edges};
-        for my $e (@$assert_edges) {
-            my $assert_settings = $e->{assert_settings};
+        for my $subedge (@$assert_edges) {
+            my $assert_settings = $subedge->{assert_settings};
             #die unless ref $assert_settings;
-            my $target = $e->{target};
+            my $target = $subedge->{target};
             $src .= $indent . "if (\$asserts == $assert_settings) {\n";
             my $indent2 = $indent . (" " x 4);
             if ($target->{accept}) {
                 $to_accept = 1;
             }
-            $src .= gen_capture_handler_perl_code($edge, $target->{accept}, $indent2);
+            $src .= gen_capture_handler_perl_code($subedge, $target->{accept}, $indent2);
             my $to = $target->{idx};
             if ($to_accept) {
                 #$src .= $indent2 . "return \$matched;\n";
