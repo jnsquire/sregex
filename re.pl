@@ -37,6 +37,9 @@ sub gen_dfa_edge ($$$$);
 sub resolve_dfa_edge ($$$$$$$$);
 sub gen_dfa_edges_for_asserts ($$$$$$);
 sub gen_capture_handler_perl_code ($$$);
+sub gen_dfa_edge_prio_range ($$);
+sub prio_higher ($$);
+sub prio_lower ($$);
 
 GetOptions("help|h",        \(my $help),
            "stdin",         \(my $stdin))
@@ -178,12 +181,13 @@ my %pc2assert;
 
 my $nfa = gen_nfa();
 #warn Dumper($nfa);
-draw_nfa($nfa);
+#draw_nfa($nfa);
 
 my $dfa = gen_dfa($nfa);
 #warn Dumper($dfa);
-draw_dfa($dfa);
+#draw_dfa($dfa);
 
+#exit;
 my $perl = gen_perl_from_dfa($dfa);
 #print $perl;
 #warn length $perl;
@@ -484,9 +488,33 @@ sub gen_dfa ($) {
                     push @all_nfa_edges, @$edges;
                 }
             }
-            # de-duplicate elements in @all_nfa_edges?
+
             $dfa_edges = gen_dfa_edges($dfa_node, \@dfa_nodes, \%dfa_node_hash,
                                        \@all_nfa_edges, $nfa, \$idx);
+            if (defined $dfa_edges && @$dfa_edges > 1) {
+                my $first = $dfa_edges->[0];
+                my $prio;
+                if ($first->{to_accept}) {
+                    my ($lo0, $hi0) = @{ $first->{prio_range} };
+                    for (my $i = 1; $i < @$dfa_edges; $i++) {
+                        my $dfa_edge = $dfa_edges->[$i];
+                        my ($lo, $hi) = @{ $dfa_edge->{prio_range} };
+                        my $label = gen_dfa_edge_label($dfa_node, $dfa_edge);
+                        #warn "DFA edge $label: comp $i vs 0: lo: $lo vs $lo0, hi: $hi vs $hi0";
+                        #warn "$hi > $lo0";
+                        if (prio_lower($hi, $lo0)) {
+                            #warn "DFA edge hit: ", $label;
+                            #warn Dumper($first);
+                            # FIXME: we hard-code the assert settings number 1 here.
+                            # we will have to use the right number here when we support
+                            # alternations of 0-width assertions, as in /(?:\b|$)/.
+                            $dfa_edge->{check_to_accept_sibling} = 1;
+                        } elsif (prio_lower($hi, $hi0)) {
+                            die "TODO: asertions need re-splitting the DFA edges";
+                        }
+                    }
+                }
+            }
             $dfa_node->{edges} = $dfa_edges;
         }
 
@@ -579,10 +607,8 @@ sub gen_dfa_edges ($$$$$$) {
 
     # process char ranges
 
-    if ($from_node->{idx} == 2) {
-        #warn "node: ", gen_dfa_node_label($from_node);
-        #warn "NFA edges: ", Dumper($nfa_edges);
-    }
+    #warn "node: ", gen_dfa_node_label($from_node);
+    #warn "  NFA edges: ", Dumper($nfa_edges);
 
     my $prio = 0;
     my @accept_edges;
@@ -591,6 +617,7 @@ sub gen_dfa_edges ($$$$$$) {
         my $to = $nfa_edge->[-1];
         my $bc = $bytecodes[$to];
         my $opcode = opcode($bc);
+        #warn "opcode: $opcode";
         if ($opcode eq 'any') {
             my ($a, $b) = (0, 255);
             push @endpoints, $a, $b;
@@ -646,22 +673,21 @@ sub gen_dfa_edges ($$$$$$) {
                     last;
                 }
             }
-            #if (!$found_asserts) {
+            #last;
+            if (!$found_asserts) {
                 #warn "no assertions found. short-cutting";
                 last;
-            #}
+            }
         } else {
             die "unknown bytecode opcode: $opcode";
         }
     }
     @endpoints = uniq sort { $a <=> $b } @endpoints;
 
-    if ($from_node->{idx} == 2) {
-        #warn "accept edges: ", Dumper(\@accept_edges);
-        #warn "left endpoint hash: ", Dumper(\%left_end_hash);
-        #warn "right endpoint hash: ", Dumper(\%right_end_hash);
-        #warn "endpoints: ", Dumper(\@endpoints);
-    }
+    #warn "accept edges: ", Dumper(\@accept_edges);
+    #warn "left endpoint hash: ", Dumper(\%left_end_hash);
+    #warn "right endpoint hash: ", Dumper(\%right_end_hash);
+    #warn "endpoints: ", Dumper(\@endpoints);
 
     # split and merge char ranges to form DFA edges
 
@@ -734,7 +760,7 @@ sub gen_dfa_edges ($$$$$$) {
     # resolve DFA edge targets
 
     if (@accept_edges) {
-        unshift @dfa_edges, gen_dfa_edge(undef, undef, \@accept_edges, undef);
+        unshift @dfa_edges, gen_dfa_edge(undef, undef, \@accept_edges, \%prio);
     }
 
     if ($from_node->{idx} == 2) {
@@ -833,16 +859,48 @@ sub resolve_dfa_edge ($$$$$$$$) {
 
 sub gen_dfa_edge ($$$$) {
     my ($a, $b, $nfa_edges, $nfa_edge_prio) = @_;
+    my $prio_range = gen_dfa_edge_prio_range($nfa_edges, $nfa_edge_prio);
     if (defined $a) {
+        my $nfa_edges = reorder_nfa_edges($nfa_edges, $nfa_edge_prio);
         return {
             char_ranges => [$a, $b],
-            nfa_edges => reorder_nfa_edges($nfa_edges, $nfa_edge_prio),
+            nfa_edges => $nfa_edges,
+            prio_range => $prio_range,
         };
     }
     return {
         to_accept => 1,
         nfa_edges => $nfa_edges,
+        prio_range => $prio_range,
     };
+}
+
+# generate priority range for the DFA edge
+# note: smaller priority numbers mean higher priorities
+sub gen_dfa_edge_prio_range ($$) {
+    my ($nfa_edges, $prio) = @_;
+    my ($hi, $lo);
+    for my $nfa_edge (@$nfa_edges) {
+        my $p = $prio->{$nfa_edge};
+        if (!defined $hi || prio_higher($p, $hi)) {
+            $hi = $p;
+        }
+        if (!defined $lo || prio_lower($p, $lo)) {
+            $lo = $p;
+        }
+    }
+    #warn "prio range for DFA edge: ($lo, $hi)";
+    return [$lo, $hi];
+}
+
+sub prio_higher ($$) {
+    my ($a, $b) = @_;
+    return $a < $b;
+}
+
+sub prio_lower ($$) {
+    my ($a, $b) = @_;
+    return $a > $b;
 }
 
 sub resolve_asserts ($) {
@@ -947,6 +1005,13 @@ sub dedup_nfa_edges ($) {
         my $last = $e->[-1];
         if ($visited{$last}) {
             next;
+        }
+        my $bc = $bytecodes[$last];
+        #warn "opcode: ", opcode($bc);
+        if (opcode($bc) eq 'match') {
+            push @ret, $e;
+            #warn "short-circuiting...";
+            last;
         }
         $visited{$last} = 1;
         push @ret, $e;
@@ -1148,11 +1213,11 @@ _EOC_
             next;
         }
         my $label = gen_dfa_node_label($node);
-        $src .= "st$idx:  # DFA node $label\n";
+        $src .= "st$idx:  { # DFA node $label\n";
         #$src .= "    warn 'entering state $label';\n";
 
         if ($node->{accept}) {
-            $src .= "    return \$matched;  # accept state\n";
+            $src .= "    return \$matched;  # accept state\n    } # end state\n";
             next;
         }
 
@@ -1194,6 +1259,7 @@ _EOC_
         }
 
         $src .= <<_EOC_;
+    }  # end state
 st${idx}_error:
     return \$matched;  # fallback
 _EOC_
@@ -1239,13 +1305,19 @@ sub gen_perl_for_dfa_edge ($$) {
         }
         $src .= $indents[$indent_idx] . "if ($cond) {\n";
         $indent_idx++;
+
+        my $sibling_assert_settings = $edge->{check_to_accept_sibling};
+        if (defined $sibling_assert_settings) {
+            my $indent = $indents[$indent_idx];
+            $src .= $indent . "if (\$asserts == $sibling_assert_settings) { return \$matched; }\n";
+        }
     }
 
     my $assert_info = $target->{assert_info};
     my $indent = $indents[$indent_idx];
     if (defined $assert_info) {
         my $asserts = $assert_info->{asserts};
-        $src .= $indent . "\$asserts = 0;\n";
+        $src .= $indent . "my \$asserts = 0;\n";
         for my $assert (sort keys %$asserts) {
             my $idx = $asserts->{$assert};
             if ($assert eq '^') {
@@ -1284,7 +1356,9 @@ sub gen_perl_for_dfa_edge ($$) {
             }
             $src .= gen_capture_handler_perl_code($edge, $target->{accept}, $indent2);
             my $to = $target->{idx};
-            if (!$to_accept) {
+            if ($to_accept) {
+                #$src .= $indent2 . "return \$matched;\n";
+            } else {
                 $src .= $indent2 . "goto st$to;\n";
             }
             $src .= $indent . "}\n";
