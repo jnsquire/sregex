@@ -6,6 +6,7 @@ use warnings;
 use IPC::Run3;
 use Data::Dumper;
 use GraphViz;
+use Time::HiRes qw( time );
 use List::MoreUtils qw( uniq firstidx );
 use List::Util qw( first max );
 use Carp qw( croak carp );
@@ -179,11 +180,18 @@ if ($big) {
 my %nfa_paths;
 my %pc2assert;
 
+#my $begin = time;
 my $nfa = gen_nfa();
+#my $elapsed = time - $begin;
+#warn "NFA generated ($elapsed sec).\n";
 #warn Dumper($nfa);
 #draw_nfa($nfa);
 
+#$begin = time;
 my $dfa = gen_dfa($nfa);
+#$elapsed = time - $begin;
+#warn "DFA generated ($elapsed sec).\n";
+
 #warn Dumper($dfa);
 #draw_dfa($dfa);
 
@@ -191,13 +199,20 @@ my $dfa = gen_dfa($nfa);
 my $perl = gen_perl_from_dfa($dfa);
 #print $perl;
 #warn length $perl;
+#$begin = time;
 my $matcher = eval $perl;
 if ($@) {
     die "failed to eval perl code: $@";
 }
+#$elapsed = time - $begin;
+#warn "Perl code loading done ($elapsed sec, length ", length($perl), ").\n";
 
 {
+    #my $begin = time;
     my $res = $matcher->($subject);
+    #$elapsed = time - $begin;
+    #warn "Perl code execution done ($elapsed sec).\n";
+
     if (!defined $res) {
         print "no match.\n";
     } else {
