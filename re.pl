@@ -26,7 +26,7 @@ sub dedup_nfa_edges ($);
 sub reorder_nfa_edges ($$);
 sub draw_dfa ($);
 sub escape_range ($$);
-sub gen_dfa_hash_key ($);
+sub gen_dfa_hash_key ($$);
 sub add_to_set ($$);
 sub remove_from_set ($$);
 sub gen_dfa_node_label ($);
@@ -34,13 +34,17 @@ sub gen_dfa_edge_label ($$);
 sub gen_perl_from_dfa ($);
 sub canon_range ($);
 sub usage ($);
-sub gen_dfa_edge ($$$$);
+sub gen_dfa_edge ($$$$$);
 sub resolve_dfa_edge ($$$$$$$$);
 sub gen_dfa_edges_for_asserts ($$$$$$);
 sub gen_capture_handler_perl_code ($$$);
 sub gen_dfa_edge_prio_range ($$);
+sub gen_perl_for_dfa_edge ($$$);
 sub prio_higher ($$);
 sub prio_lower ($$);
+sub dump_code ($);
+
+my $DEBUG = 0;
 
 GetOptions("help|h",        \(my $help),
            "stdin",         \(my $stdin))
@@ -186,7 +190,7 @@ my $nfa = gen_nfa();
 #my $elapsed = time - $begin;
 #warn "NFA generated ($elapsed sec).\n";
 #warn Dumper($nfa);
-#draw_nfa($nfa);
+draw_nfa($nfa) if $DEBUG;
 
 #$begin = time;
 my $dfa = gen_dfa($nfa);
@@ -194,11 +198,11 @@ my $dfa = gen_dfa($nfa);
 #warn "DFA generated ($elapsed sec).\n";
 
 #warn Dumper($dfa);
-#draw_dfa($dfa);
+draw_dfa($dfa) if $DEBUG;
 
 #exit;
 my $perl = gen_perl_from_dfa($dfa);
-#warn $perl;
+warn dump_code($perl) if $DEBUG == 2;
 #warn length $perl;
 #$begin = time;
 my $matcher = eval $perl;
@@ -430,6 +434,7 @@ sub escape_char ($) {
     my $c = chr($code);
     my $escaped = $escaped_chars{$c};
     if (defined $escaped) {
+        $escaped =~ s/\\/\\\\/g;
         return $escaped;
     }
     if ($c =~ /[[:alnum:]]/) {
@@ -517,7 +522,7 @@ sub gen_dfa ($) {
                     for (my $i = 1; $i < @$dfa_edges; $i++) {
                         my $dfa_edge = $dfa_edges->[$i];
                         my ($lo, $hi) = @{ $dfa_edge->{prio_range} };
-                        my $label = gen_dfa_edge_label($dfa_node, $dfa_edge);
+                        #my $label = gen_dfa_edge_label($dfa_node, $dfa_edge);
                         #warn "  DFA edge $label: comp $i vs 0: lo: $lo vs $lo0, hi: $hi vs $hi0";
                         #warn "$hi > $lo0";
                         if (prio_lower($hi, $lo0)) {
@@ -526,9 +531,8 @@ sub gen_dfa ($) {
                             # FIXME: we hard-code the assert settings number 1 here.
                             # we will have to use the right number here when we support
                             # alternations of 0-width assertions, as in /(?:\b|$)/.
-                            $dfa_edge->{check_to_accept_sibling} = 1;
-                        } elsif (prio_lower($hi, $hi0)) {
-                            die "TODO: asertions need re-splitting the DFA edges";
+                            die unless $dfa_edge->{check_to_accept_sibling};
+                            #$dfa_edge->{check_to_accept_sibling} = 1;
                         }
                     }
                 }
@@ -537,33 +541,16 @@ sub gen_dfa ($) {
         }
 
         # fix the path mappings in the DFA edges
-        # TODO: skip this step for assert-typed nodes.
 
-        #warn "DFA node ", gen_dfa_node_label($dfa_node), "\n";
         for my $dfa_edge (@$dfa_edges) {
-            my $nfa_edges = $dfa_edge->{nfa_edges};
-            my $src_states = $dfa_node->{states};
-            my @mappings;
-            my %assigned;
-            my $from_row = 0;
-            #warn "source state: ", join(",", @$src_states), " => ", gen_dfa_node_label($dfa_edge->{target}), "\n";
-            for my $src_state (@$src_states) {
-                my $to_row = 0;
-                for my $nfa_edge (@$nfa_edges) {
-                    my $to_pc = $nfa_edge->[0];
-                    my $key = "$src_state-$to_pc";
-                    if (!$assigned{$to_row} && $nfa_paths{$key}) {
-                        #warn "  mapping: $from_row => $to_row\n";
-                        push @mappings, [$from_row, $to_row];
-                        $assigned{$to_row} = 1;
-                    }
-                    $to_row++;
-                }
-                $from_row++;
+            calc_capture_mapping($dfa_node, $dfa_edge);
+            my $shadowing = $dfa_edge->{shadowing};
+            if (defined $shadowing) {
+                calc_capture_mapping($dfa_node, $shadowing);
             }
-            $dfa_edge->{capture_mappings} = \@mappings;
         }
 
+        #warn "DFA node ", gen_dfa_node_label($dfa_node), "\n";
         $i++;
     }
 
@@ -631,9 +618,14 @@ sub gen_dfa_edges ($$$$$$) {
     #warn "  NFA edges: ", Dumper($nfa_edges);
 
     my $prio = 0;
-    my @accept_edges;
+    my (@accept_edges, $in_shadow, %shadowed_nfa_edges);
     for my $nfa_edge (@$nfa_edges) {
         $prio{$nfa_edge} = $prio++;
+
+        if ($in_shadow) {
+            $shadowed_nfa_edges{$nfa_edge} = 1;
+        }
+
         my $to = $nfa_edge->[-1];
         my $bc = $bytecodes[$to];
         my $opcode = opcode($bc);
@@ -698,6 +690,12 @@ sub gen_dfa_edges ($$$$$$) {
                 #warn "no assertions found. short-cutting";
                 last;
             }
+            # the remaining NFA edges are shadowed by this to-accept NFA edge
+            # with assertins.
+            #if (defined $in_shadow) {
+                #die "TODO: nested shadows";
+            #}
+            $in_shadow = 1;
         } else {
             die "unknown bytecode opcode: $opcode";
         }
@@ -726,7 +724,8 @@ sub gen_dfa_edges ($$$$$$) {
             my $right_nfa_edges = $right_end_hash{$p};
             if (defined $right_nfa_edges) {
                 # singular
-                push @dfa_edges, gen_dfa_edge($prev, $p, \@active_nfa_edges, \%prio);
+                push @dfa_edges, gen_dfa_edge($prev, $p, \@active_nfa_edges,
+                                              \%prio, \%shadowed_nfa_edges);
                 remove_from_set(\@active_nfa_edges, $right_nfa_edges);
                 if (@active_nfa_edges) {
                     $prev++;
@@ -745,10 +744,12 @@ sub gen_dfa_edges ($$$$$$) {
             if (defined $right_nfa_edges && defined $left_nfa_edges) {
                 if ($prev <= $p - 1) {
                     push @dfa_edges, gen_dfa_edge($prev, $p - 1,
-                                                      \@active_nfa_edges, \%prio);
+                                                  \@active_nfa_edges, \%prio,
+                                                  \%shadowed_nfa_edges);
                 }
                 add_to_set(\@active_nfa_edges, $left_nfa_edges);
-                push @dfa_edges, gen_dfa_edge($p, $p, \@active_nfa_edges, \%prio);
+                push @dfa_edges, gen_dfa_edge($p, $p, \@active_nfa_edges, \%prio,
+                                              \%shadowed_nfa_edges);
                 remove_from_set(\@active_nfa_edges, $right_nfa_edges);
                 if (!@active_nfa_edges) {
                     undef $prev;
@@ -758,7 +759,7 @@ sub gen_dfa_edges ($$$$$$) {
 
             } elsif (defined $right_nfa_edges) {
                 push @dfa_edges, gen_dfa_edge($prev, $p, \@active_nfa_edges,
-                                                  \%prio);
+                                              \%prio, \%shadowed_nfa_edges);
                 remove_from_set(\@active_nfa_edges, $right_nfa_edges);
                 if (!@active_nfa_edges) {
                     undef $prev;
@@ -769,7 +770,8 @@ sub gen_dfa_edges ($$$$$$) {
             } elsif (defined $left_nfa_edges) {
                 if ($prev <= $p - 1) {
                     push @dfa_edges, gen_dfa_edge($prev, $p - 1,
-                                                      \@active_nfa_edges, \%prio);
+                                                  \@active_nfa_edges, \%prio,
+                                                  \%shadowed_nfa_edges);
                 }
                 add_to_set(\@active_nfa_edges, $left_nfa_edges);
                 $prev = $p;
@@ -780,17 +782,23 @@ sub gen_dfa_edges ($$$$$$) {
     # resolve DFA edge targets
 
     if (@accept_edges) {
-        unshift @dfa_edges, gen_dfa_edge(undef, undef, \@accept_edges, \%prio);
+        my $accept_dfa_edge = gen_dfa_edge(undef, undef, \@accept_edges, \%prio, undef);
+        unshift @dfa_edges, $accept_dfa_edge;
     }
 
-    if ($from_node->{idx} == 2) {
+    #if ($from_node->{idx} == 2) {
         #warn "DFA edges: ", Dumper(\@dfa_edges);
-    }
+    #}
 
     my %targets;
     for my $dfa_edge (@dfa_edges) {
         $dfa_edge = resolve_dfa_edge($from_node, $dfa_edge, \@accept_edges, \%targets,
                                      $dfa_nodes, $dfa_node_hash, $idx_ref, 0);
+        next unless defined $dfa_edge;
+        if ($dfa_edge->{shadowed}) {
+            $dfa_edge = undef;
+            next;
+        }
     }
 
     @dfa_edges = grep { defined } @dfa_edges;
@@ -821,7 +829,7 @@ sub resolve_dfa_edge ($$$$$$$$) {
 
     my ($key, $target_dfa_node);
     if (!defined $assert_info) {
-        $key = gen_dfa_hash_key(\@states);
+        $key = gen_dfa_hash_key(\@states, $dfa_edge);
         #warn "dfa state key: ", $key;
         my $old_edge = $targets->{$key};
         if (defined $old_edge) {
@@ -877,22 +885,58 @@ sub resolve_dfa_edge ($$$$$$$$) {
     return $dfa_edge;
 }
 
-sub gen_dfa_edge ($$$$) {
-    my ($a, $b, $nfa_edges, $nfa_edge_prio) = @_;
-    my $prio_range = gen_dfa_edge_prio_range($nfa_edges, $nfa_edge_prio);
-    if (defined $a) {
-        my $nfa_edges = reorder_nfa_edges($nfa_edges, $nfa_edge_prio);
+# may return two DFA edges in case of shadow splitting
+sub gen_dfa_edge ($$$$$) {
+    my ($a, $b, $nfa_edges, $nfa_edge_prio, $shadowed_nfa_edges) = @_;
+
+    if (!defined $shadowed_nfa_edges) {
+        my $prio_range = gen_dfa_edge_prio_range($nfa_edges, $nfa_edge_prio);
+        if (defined $a) {
+            my $nfa_edges = reorder_nfa_edges($nfa_edges, $nfa_edge_prio);
+            return {
+                char_ranges => [$a, $b],
+                nfa_edges => $nfa_edges,
+                prio_range => $prio_range,
+            };
+        }
         return {
-            char_ranges => [$a, $b],
+            to_accept => 1,
             nfa_edges => $nfa_edges,
             prio_range => $prio_range,
         };
     }
-    return {
-        to_accept => 1,
-        nfa_edges => $nfa_edges,
-        prio_range => $prio_range,
-    };
+
+    # try to split the DFA edge if there are shadowed NFA edges mixed.
+
+    my (@unshadowed);
+    for my $nfa_edge (@$nfa_edges) {
+        my $v = $shadowed_nfa_edges->{$nfa_edge};
+        if (!$v) {
+            push @unshadowed, $nfa_edge;
+        }
+    }
+
+    if (@unshadowed == @$nfa_edges) {
+        local @_ = ($a, $b, $nfa_edges, $nfa_edge_prio, undef);
+        goto \&gen_dfa_edge;
+    }
+
+    if (@unshadowed == 0) {
+        my $dfa_edge = gen_dfa_edge($a, $b, $nfa_edges, $nfa_edge_prio, undef);
+        $dfa_edge->{check_to_accept_sibling} = 1;
+        return $dfa_edge;
+    }
+
+    #warn "found shadowed! ", scalar @unshadowed, " vs ", scalar @$nfa_edges;
+
+    # generate two DFA edges, one shadowing the other according to the result
+    # of the assertions on the shadowing DFA edge (the to-accept edge).
+    my $wide_dfa_edge = gen_dfa_edge($a, $b, $nfa_edges, $nfa_edge_prio, undef);
+    my $narrow_dfa_edge = gen_dfa_edge($a, $b, \@unshadowed, $nfa_edge_prio, undef);
+    $narrow_dfa_edge->{shadowing} = $wide_dfa_edge;
+    #delete $wide_dfa_edge->{char_ranges};
+    $wide_dfa_edge->{shadowed} = 1;
+    return $narrow_dfa_edge, $wide_dfa_edge;
 }
 
 # generate priority range for the DFA edge
@@ -1039,10 +1083,11 @@ sub dedup_nfa_edges ($) {
     return \@ret;
 }
 
-sub gen_dfa_hash_key ($) {
-    my ($states) = @_;
+sub gen_dfa_hash_key ($$) {
+    my ($states, $dfa_edge) = @_;
     #carp "nfa edges: ", Dumper($nfa_edges);
-    join ",", @$states;
+    return ($dfa_edge->{shadowing} ? '2-' : $dfa_edge->{shadowed} ? '1-' : '0-')
+           . join ",", @$states;
 }
 
 sub add_to_set ($$) {
@@ -1107,6 +1152,15 @@ sub draw_dfa ($) {
             my $to_idx = $to->{idx};
             $graph->add_edge("n$from_idx" => "n$to_idx", label => $label,
                              len => max(length($label) / 6, 1.7));
+            my $shadowing = $e->{shadowing};
+            if (defined $shadowing) {
+                #my $label = gen_dfa_edge_label($node, $shadowing);
+                my $to = $shadowing->{target};
+                my $to_idx = $to->{idx};
+                $graph->add_edge("n$from_idx" => "n$to_idx", label => $label,
+                                 len => max(length($label) / 6, 1.7),
+                                 style => 'dashed');
+            }
         }
     }
 
@@ -1234,7 +1288,7 @@ _EOC_
         }
         my $label = gen_dfa_node_label($node);
         $src .= "st$idx:  { # DFA node $label\n";
-        #$src .= "    warn 'entering state $label';\n";
+        $src .= "    warn 'entering state $label';\n" if $DEBUG;
 
         if ($node->{accept}) {
             $src .= "    return \$matched;  # accept state\n    } # end state\n";
@@ -1242,13 +1296,13 @@ _EOC_
         }
 
         $src .= "    \$c = \$b[\$i++];\n";
-        #$src .= "    warn \"reading new char \", \$c || 'nil', \"\\n\";\n";
+        $src .= "    warn \"reading new char \", \$c || 'nil', \"\\n\";\n" if $DEBUG;
 
         my $first_time = 1;
         my $edges = $node->{edges};
         my $seen_accept;
         for my $edge (@$edges) {
-            my ($new_src, $to_accept) = gen_perl_for_dfa_edge($edge, $level);
+            my ($new_src, $to_accept) = gen_perl_for_dfa_edge($idx, $edge, $level);
 
             if ($to_accept) {
                 $seen_accept = 1;
@@ -1291,8 +1345,8 @@ _EOC_
     return $src;
 }
 
-sub gen_perl_for_dfa_edge ($$) {
-    my ($edge, $level) = @_;
+sub gen_perl_for_dfa_edge ($$$) {
+    my ($from_node_idx, $edge, $level) = @_;
 
     my $src = '';
     my @indents = (" " x (4 * $level), " " x (4 * ($level + 1)));
@@ -1305,7 +1359,7 @@ sub gen_perl_for_dfa_edge ($$) {
     #warn "to accept: $to_accept";
 
     my @cond;
-    if (defined $ranges) {
+    if (defined $ranges && !$edge->{shadowed}) {
         for (my $i = 0; $i < @$ranges; $i += 2) {
             my ($a, $b) = ($ranges->[$i], $ranges->[$i + 1]);
             if ($a == $b) {
@@ -1330,6 +1384,20 @@ sub gen_perl_for_dfa_edge ($$) {
         if (defined $sibling_assert_settings) {
             my $indent = $indents[$indent_idx];
             $src .= $indent . "if (\$asserts == $sibling_assert_settings) { return \$matched; }\n";
+
+        } else {
+            my $shadowing = $edge->{shadowing};
+            if (defined $shadowing) {
+                my $indent = $indents[$indent_idx];
+                $src .= $indent . "if (\$asserts != 1) { # shadowed DFA edge\n";
+                my ($inner, $to_accept) = gen_perl_for_dfa_edge($from_node_idx, $shadowing, $level + 2);
+                if (defined $inner) {
+                    $src .= $inner;
+                }
+                die if $to_accept;
+                #$src .= $indent . "    goto st${from_node_idx}_error;\n";
+                $src .= $indent . "}\n";
+            }
         }
     }
 
@@ -1360,10 +1428,14 @@ sub gen_perl_for_dfa_edge ($$) {
             } else {
                 die "TODO";
             }
-            #$src .= $indent . "warn 'assertion $assert test result: ', \$asserts, \", idx = $idx, i = \$i, c = \$c\n\";\n";
+            $src .= $indent . "warn 'assertion $assert test result: ', \$asserts, \", idx = $idx, i = \$i, c = \$c\n\";\n"
+                if $DEBUG;
         }
 
         my $assert_edges = $target->{edges};
+
+        #warn "assert edges: $assert_edges\n";
+
         for my $subedge (@$assert_edges) {
             my $assert_settings = $subedge->{assert_settings};
             #die unless ref $assert_settings;
@@ -1390,6 +1462,10 @@ sub gen_perl_for_dfa_edge ($$) {
 
         my $to = $target->{idx};
         if (!$to_accept) {
+            if (!defined $to) {
+                warn Dumper($edge);
+                croak Dumper($target);
+            }
             $src .= $indent . "goto st$to;\n";
         }
     }
@@ -1467,4 +1543,35 @@ _EOC_
     }
     print $msg;
     exit 0;
+}
+
+sub dump_code ($) {
+    my ($code) = @_;
+    my $ln = 1;
+    (my $str = $code) =~ s/^/$ln++/gem;
+    return $str;
+}
+
+sub calc_capture_mapping ($$) {
+    my ($from_node, $dfa_edge) = @_;
+    my $nfa_edges = $dfa_edge->{nfa_edges};
+    my $src_states = $from_node->{states};
+    my (@mappings, %assigned);
+    my $from_row = 0;
+    #warn "source state: ", join(",", @$src_states), " => ", gen_dfa_node_label($dfa_edge->{target}), "\n";
+    for my $src_state (@$src_states) {
+        my $to_row = 0;
+        for my $nfa_edge (@$nfa_edges) {
+            my $to_pc = $nfa_edge->[0];
+            my $key = "$src_state-$to_pc";
+            if (!$assigned{$to_row} && $nfa_paths{$key}) {
+                #warn "  mapping: $from_row => $to_row\n";
+                push @mappings, [$from_row, $to_row];
+                $assigned{$to_row} = 1;
+            }
+            $to_row++;
+        }
+        $from_row++;
+    }
+    $dfa_edge->{capture_mappings} = \@mappings;
 }
