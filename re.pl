@@ -38,10 +38,7 @@ sub gen_dfa_edge ($$$$$);
 sub resolve_dfa_edge ($$$$$$$$);
 sub gen_dfa_edges_for_asserts ($$$$$$);
 sub gen_capture_handler_perl_code ($$$);
-sub gen_dfa_edge_prio_range ($$);
 sub gen_perl_for_dfa_edge ($$$);
-sub prio_higher ($$);
-sub prio_lower ($$);
 sub dump_code ($);
 
 my $DEBUG = 0;
@@ -513,30 +510,6 @@ sub gen_dfa ($) {
 
             $dfa_edges = gen_dfa_edges($dfa_node, \@dfa_nodes, \%dfa_node_hash,
                                        \@all_nfa_edges, $nfa, \$idx);
-            if (defined $dfa_edges && @$dfa_edges > 1) {
-                my $first = $dfa_edges->[0];
-                my $prio;
-                if ($first->{to_accept}) {
-                    my ($lo0, $hi0) = @{ $first->{prio_range} };
-                    #warn "DFA node: ", gen_dfa_node_label($dfa_node), "\n";
-                    for (my $i = 1; $i < @$dfa_edges; $i++) {
-                        my $dfa_edge = $dfa_edges->[$i];
-                        my ($lo, $hi) = @{ $dfa_edge->{prio_range} };
-                        #my $label = gen_dfa_edge_label($dfa_node, $dfa_edge);
-                        #warn "  DFA edge $label: comp $i vs 0: lo: $lo vs $lo0, hi: $hi vs $hi0";
-                        #warn "$hi > $lo0";
-                        if (prio_lower($hi, $lo0)) {
-                            #warn "DFA edge hit: ", $label;
-                            #warn Dumper($first);
-                            # FIXME: we hard-code the assert settings number 1 here.
-                            # we will have to use the right number here when we support
-                            # alternations of 0-width assertions, as in /(?:\b|$)/.
-                            die unless $dfa_edge->{check_to_accept_sibling};
-                            #$dfa_edge->{check_to_accept_sibling} = 1;
-                        }
-                    }
-                }
-            }
             $dfa_node->{edges} = $dfa_edges;
         }
 
@@ -890,19 +863,19 @@ sub gen_dfa_edge ($$$$$) {
     my ($a, $b, $nfa_edges, $nfa_edge_prio, $shadowed_nfa_edges) = @_;
 
     if (!defined $shadowed_nfa_edges) {
-        my $prio_range = gen_dfa_edge_prio_range($nfa_edges, $nfa_edge_prio);
+        #my $prio_range = gen_dfa_edge_prio_range($nfa_edges, $nfa_edge_prio);
         if (defined $a) {
             my $nfa_edges = reorder_nfa_edges($nfa_edges, $nfa_edge_prio);
             return {
                 char_ranges => [$a, $b],
                 nfa_edges => $nfa_edges,
-                prio_range => $prio_range,
+                #prio_range => $prio_range,
             };
         }
         return {
             to_accept => 1,
             nfa_edges => $nfa_edges,
-            prio_range => $prio_range,
+            #prio_range => $prio_range,
         };
     }
 
@@ -937,34 +910,6 @@ sub gen_dfa_edge ($$$$$) {
     #delete $wide_dfa_edge->{char_ranges};
     $wide_dfa_edge->{shadowed} = 1;
     return $narrow_dfa_edge, $wide_dfa_edge;
-}
-
-# generate priority range for the DFA edge
-# note: smaller priority numbers mean higher priorities
-sub gen_dfa_edge_prio_range ($$) {
-    my ($nfa_edges, $prio) = @_;
-    my ($hi, $lo);
-    for my $nfa_edge (@$nfa_edges) {
-        my $p = $prio->{$nfa_edge};
-        if (!defined $hi || prio_higher($p, $hi)) {
-            $hi = $p;
-        }
-        if (!defined $lo || prio_lower($p, $lo)) {
-            $lo = $p;
-        }
-    }
-    #warn "prio range for DFA edge: ($lo, $hi)";
-    return [$lo, $hi];
-}
-
-sub prio_higher ($$) {
-    my ($a, $b) = @_;
-    return $a < $b;
-}
-
-sub prio_lower ($$) {
-    my ($a, $b) = @_;
-    return $a > $b;
 }
 
 sub resolve_asserts ($) {
