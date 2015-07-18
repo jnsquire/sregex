@@ -218,6 +218,15 @@ warn dump_code($c) if $DEBUG == 2;
         $extra_ccopt = "-Wall -Wno-unused-label -Wno-unused-variable -Wno-unused-but-set-variable -Werror";
     }
     system("$cc -o $exefile $extra_ccopt $fname") == 0 or die "$!\n";
+
+    #{
+        #my @info = stat $exefile;
+        #my $size = $info[7];
+        #if ($size >= 1024 * 1024) {
+            #warn "$re - size $size\n";
+        #}
+    #}
+
     my @cmd = ($exefile);
 
     #my $begin = time;
@@ -1061,6 +1070,10 @@ sub dedup_nfa_edges ($) {
 sub gen_dfa_hash_key ($$) {
     my ($states, $dfa_edge) = @_;
     #carp "nfa edges: ", Dumper($nfa_edges);
+
+    # FIXME: we should distinguish different shadowing groups here
+    # currently this issue can be exposed by gcc's -Wunused-label warnings.
+
     my $shadowing = $dfa_edge->{shadowing};
     my $key = (defined $shadowing ? "2-" : $dfa_edge->{shadowed} ? '1-' : '0-')
            . join ",", @$states;
