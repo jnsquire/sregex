@@ -5,9 +5,9 @@
 use strict;
 use warnings;
 
-use IPC::Run3;
-use Data::Dumper;
-use GraphViz;
+use IPC::Run3 qw( run3 );
+use Data::Dumper qw( Dumper );
+use GraphViz ();
 use Time::HiRes qw( time );
 use List::MoreUtils qw( uniq firstidx );
 use List::Util qw( first max );
@@ -15,6 +15,7 @@ use Carp qw( croak carp );
 use Getopt::Long qw( GetOptions );
 use File::Temp qw( tempfile );
 use POSIX qw( tmpnam );
+use File::Spec ();
 
 sub add_nfa_edges ($$$$);
 sub gen_nfa_edge_label ($);
@@ -51,6 +52,8 @@ my $debug = 0;
 GetOptions("help|h",        \(my $help),
            "cc=s",          \$cc,
            "debug=i",       \$debug,
+           "out|o=s",       \(my $exefile),
+           "timing",        \(my $timing),
            "stdin",         \(my $stdin))
    or die usage(1);
 
@@ -213,13 +216,24 @@ warn dump_code($c) if $debug == 2;
     #warn $fname;
     print $fh $c;
     close $fh;
-    my $exefile = tmpnam();
+
+    my $exe_tmp;
+    if (!defined $exefile) {
+        $exefile = tmpnam();
+        $exe_tmp = 1;
+    } else {
+        unlink $exefile if -f $exefile;
+    }
+
     #system("cc -o $exefile -Wall -Wno-unused-label -Wno-unused-variable -Wno-unused-but-set-variable -Werror -O0 $fname") == 0
     my $extra_ccopt = "";
     if ($debug) {
         $extra_ccopt = "-Wall -Wno-unused-label -Wno-unused-variable -Wno-unused-but-set-variable -Werror";
     }
-    system("$cc -o $exefile $extra_ccopt $fname") == 0 or die "$!\n";
+
+    my $cmd = "$cc -o $exefile $extra_ccopt $fname";
+    #warn $cmd;
+    system($cmd) == 0 or die "$!\n";
 
     #{
         #my @info = stat $exefile;
@@ -229,7 +243,8 @@ warn dump_code($c) if $debug == 2;
         #}
     #}
 
-    my @cmd = ($exefile);
+    my $path = File::Spec->rel2abs($exefile);
+    my @cmd = ($path);
 
     #my $begin = time;
     #$elapsed = time - $begin;
@@ -243,7 +258,15 @@ warn dump_code($c) if $debug == 2;
         print STDERR $err;
     }
 
-    unlink $exefile or die $!;
+    if ($rc != 0) {
+        die "failed to run the executable file $exefile: $rc\n";
+    }
+
+    if ($exe_tmp) {
+        unlink $exefile or die $!;
+    } else {
+        #warn "file $exefile generated.\n";
+    }
 
     if (!defined $out) {
         die "program crashed: $rc";
@@ -836,6 +859,28 @@ sub gen_dfa_edges ($$$$$$) {
     }
 
     @dfa_edges = grep { defined } @dfa_edges;
+    @dfa_edges = sort {
+        my $n1 = defined $a->{char_ranges} ? @{ $a->{char_ranges} } : 0;
+        my $n2 = defined $b->{char_ranges} ? @{ $b->{char_ranges} } : 0;
+        $n1 <=> $n2;
+    } @dfa_edges;
+
+    {
+        my @total_ranges;
+        for my $dfa_edge (@dfa_edges) {
+            my $range = $dfa_edge->{char_ranges};
+            if (defined $range) {
+                push @total_ranges, @$range;
+            }
+        }
+        if (@total_ranges) {
+            canon_range(\@total_ranges);
+            #warn "canon total range: @total_ranges";
+            if (@total_ranges == 2 && $total_ranges[0] == 0 && $total_ranges[1] == 255) {
+                $dfa_edges[-1]->{default_branch} = 1;
+            }
+        }
+    }
 
     #warn "DFA edges: ", Dumper(\@dfa_edges);
     return \@dfa_edges;
@@ -1060,6 +1105,26 @@ sub canon_range ($) {
             }
         }
     }
+    if (@new > 2) {
+        my @new2;
+        push @new2, $new[0];
+        my $prev = $new[1];
+        my $found;
+        for (my $i = 2; $i < @new; $i += 2) {
+            my $cur = $new[$i];
+            if ($cur == $prev + 1) {
+                # swallow up the previous (left) end point and the current (right) end point
+                $found = 1;
+            } else {
+                push @new2, $prev, $cur;
+            }
+            $prev = $new[$i + 1];
+        }
+        if ($found) {
+            push @new2, $prev;
+            @new = @new2;
+        }
+    }
     @$args = @new;
 }
 
@@ -1259,10 +1324,41 @@ sub escape_range ($$) {
 sub gen_c_from_dfa ($) {
     my ($dfa) = @_;
 
-    my $src = <<'_EOC_';
+    my $nvec = $dfa->{nvec};
+    #die "nvec: $nvec";
+
+    my ($timing_code1, $timing_code2);
+    if ($timing) {
+        $timing_code1 = <<'_EOC_';
+        double               elapsed;
+        struct timespec      begin, end;
+
+        if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &begin) == -1) {
+            perror("clock_gettime");
+            exit(2);
+        }
+_EOC_
+
+        $timing_code2 = <<'_EOC_';
+        if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &end) == -1) {
+            perror("clock_gettime");
+            exit(2);
+        }
+        elapsed = (end.tv_sec - begin.tv_sec) * 1e3 + (end.tv_nsec - begin.tv_nsec) * 1e-6;
+        printf("sregex dfa: %.02lf ms elapsed: ", elapsed);
+_EOC_
+    } else {
+        $timing_code1 = '';
+        $timing_code2 = '';
+    }
+
+    my $src = <<_EOC_;
 #include <stdlib.h>
 #include <stdio.h>
 #include <ctype.h>
+#include <errno.h>
+#include <time.h>
+#include <string.h>
 
 
 #define u_char  unsigned char
@@ -1275,6 +1371,9 @@ enum {
 };
 
 
+static int match(const u_char *s, size_t len, int *ovec);
+
+
 static inline int
 is_word_boundary(int a, int b)
 {
@@ -1284,15 +1383,99 @@ is_word_boundary(int a, int b)
 }
 
 
+int
+main(void)
+{
+    int          ovec[$nvec];
+    char        *p, *buf;
+    size_t       len, bufsize, rest;
+
+    buf = malloc(BUFSIZE);
+    if (buf == NULL) {
+        perror("malloc");
+        exit(1);
+    }
+
+    p = buf;
+    len = 0;
+    bufsize = BUFSIZE;
+    rest = BUFSIZE;
+
+    do {
+        int rc;
+
+        rc = fread(p, 1, rest, stdin);
+        if (rc < rest) {
+            if (ferror(stdin)) {
+                perror("fread");
+                exit(1);
+            }
+
+            /* must have reached eof */
+            len += rc;
+            break;
+        }
+
+        /* rc == rest */
+
+        len += rc;
+
+        if (feof(stdin)) {
+            p += rc;
+            break;
+        }
+
+        /* grow the buffer */
+        rest = bufsize;
+        bufsize <<= 1;
+        buf = realloc(buf, bufsize);
+        if (buf == NULL) {
+            perror("malloc");
+            exit(1);
+        }
+
+        p = buf + len;
+    } while (1);
+
+    if ($debug == 2) {
+        fprintf(stderr, "input string: %.*s\\n", (int) len, buf);
+    }
+
+    memset(ovec, -1, sizeof(ovec)/sizeof(ovec[0]));
+
+    {
+        int rc;
+$timing_code1
+        rc = match((u_char *) buf, len, ovec);
+$timing_code2
+        if (rc == NO_MATCH || (ovec[0] == -1 && ovec[1] == -1)) {
+            printf("no match.\\n");
+            return 0;
+        }
+    }
+
+    /* matched */
+
+    printf("matched:");
+    {
+        int i;
+
+        for (i = 0; i < $nvec; i += 2) {
+            printf(" (%d, %d)", ovec[i], ovec[i + 1]);
+        }
+    }
+    printf("\\n");
+
+    return 0;
+}
+
+
 static int
 match(const u_char *s, size_t len, int *ovec)
 {
     int c;
     int i = 0;
 _EOC_
-
-    my $nvec = $dfa->{nvec};
-    #die "nvec: $nvec";
 
     {
         for (my $i = 0; $i < $nvec; $i++) {
@@ -1388,89 +1571,7 @@ _EOC_
 
         $src .= "    return MATCHED;  /* fallback */\n";
     }
-
     $src .= <<"_EOC_";
-}
-
-
-int
-main(void)
-{
-    int          ovec[$nvec];
-    char        *p, *buf;
-    size_t       len, bufsize, rest;
-
-    buf = malloc(BUFSIZE);
-    if (buf == NULL) {
-        perror("malloc");
-        exit(1);
-    }
-
-    p = buf;
-    len = 0;
-    bufsize = BUFSIZE;
-    rest = BUFSIZE;
-
-    do {
-        int rc;
-
-        rc = fread(p, 1, rest, stdin);
-        if (rc < rest) {
-            if (ferror(stdin)) {
-                perror("fread");
-                exit(1);
-            }
-
-            /* must have reached eof */
-            len += rc;
-            break;
-        }
-
-        /* rc == rest */
-
-        len += rc;
-        p += rc;
-
-        if (feof(stdin)) {
-            break;
-        }
-
-        /* grow the buffer */
-        rest = bufsize;
-        bufsize <<= 1;
-        buf = realloc(buf, bufsize);
-        if (buf == NULL) {
-            perror("malloc");
-            exit(1);
-        }
-    } while (1);
-
-    if ($debug == 2) {
-        fprintf(stderr, "input string: %.*s\\n", (int) len, buf);
-    }
-
-    {
-        int rc;
-        rc = match((u_char *) buf, len, ovec);
-        if (rc == NO_MATCH) {
-            printf("no match.\\n");
-            return 0;
-        }
-    }
-
-    /* matched */
-
-    printf("matched:");
-    {
-        int i;
-
-        for (i = 0; i < $nvec; i += 2) {
-            printf(" (%d, %d)", ovec[i], ovec[i + 1]);
-        }
-    }
-    printf("\\n");
-
-    return 0;
 }
 _EOC_
     return $src;
@@ -1486,6 +1587,7 @@ sub gen_c_for_dfa_edge ($$$$) {
     my $ranges = $edge->{char_ranges};
     my $target = $edge->{target};
     my $to_accept = $edge->{to_accept};
+    my $default_br = $edge->{default_branch};
 
     #warn "to accept: $to_accept";
 
@@ -1508,8 +1610,13 @@ sub gen_c_for_dfa_edge ($$$$) {
         } else {
             $cond = join " || ", map { "($_)" } @cond;
         }
-        $src .= $indents[$indent_idx] . "if ($cond) {\n";
-        $indent_idx++;
+
+        if ($default_br) {
+            $src .= $indents[$indent_idx] . "/* $cond */\n";
+        } else {
+            $src .= $indents[$indent_idx] . "if ($cond) {\n";
+        }
+        $indent_idx++ if !$default_br;
 
         my $sibling_assert_settings = $edge->{check_to_accept_sibling};
         if (defined $sibling_assert_settings) {
@@ -1606,8 +1713,10 @@ sub gen_c_for_dfa_edge ($$$$) {
     }
 
     if (@cond) {
-        $indent_idx--;
-        $src .= $indents[$indent_idx] . "}\n";
+        if (!$default_br) {
+            $indent_idx--;
+            $src .= $indents[$indent_idx] . ($default_br ? "/* " : "") . "}\n";
+        }
     }
 
     return $src, $to_accept;
@@ -1730,6 +1839,12 @@ Options:
                     0, 1, and 2.
 
     --help          show this usage.
+
+    --out=FILE      specify the output executable file generated by the
+                    C compiler.
+
+    --timing        insert timing code for the match routine in the compiled
+                    program.
 
     --stdin         accept the subject string (to be matched) from the
                     stdin device instead of the second command-line
