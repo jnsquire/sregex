@@ -1,5 +1,7 @@
 #!/usr/bin/env perl
 
+# Copyright (C) 2015 Yichun Zhang (agentzh)
+
 use strict;
 use warnings;
 
@@ -43,12 +45,12 @@ sub gen_capture_handler_c_code ($$$$);
 sub gen_c_for_dfa_edge ($$$$);
 sub dump_code ($);
 
-my $DEBUG = 0;
-
 my $cc = "cc";
+my $debug = 0;
 
 GetOptions("help|h",        \(my $help),
            "cc=s",          \$cc,
+           "debug=i",       \$debug,
            "stdin",         \(my $stdin))
    or die usage(1);
 
@@ -90,7 +92,7 @@ if ($stdin) {
 my @cmd = ("./sregex-cli", $re);
 run3 \@cmd, undef, \(my $res), \(my $err);
 
-print "$res";
+warn "$res" if $debug;
 open my $in, "<", \$res or die $!;
 
 my (@bytecodes, $found);
@@ -192,7 +194,7 @@ my $nfa = gen_nfa();
 #my $elapsed = time - $begin;
 #warn "NFA generated ($elapsed sec).\n";
 #warn Dumper($nfa);
-draw_nfa($nfa) if $DEBUG;
+draw_nfa($nfa) if $debug;
 
 #$begin = time;
 my $dfa = gen_dfa($nfa);
@@ -200,11 +202,11 @@ my $dfa = gen_dfa($nfa);
 #warn "DFA generated ($elapsed sec).\n";
 
 #warn Dumper($dfa);
-draw_dfa($dfa) if $DEBUG;
+draw_dfa($dfa) if $debug;
 
 #exit;
 my $c = gen_c_from_dfa($dfa);
-warn dump_code($c) if $DEBUG == 2;
+warn dump_code($c) if $debug == 2;
 #$begin = time;
 {
     my ($fh, $fname) = tempfile(SUFFIX => '.c', UNLINK => 1);
@@ -214,7 +216,7 @@ warn dump_code($c) if $DEBUG == 2;
     my $exefile = tmpnam();
     #system("cc -o $exefile -Wall -Wno-unused-label -Wno-unused-variable -Wno-unused-but-set-variable -Werror -O0 $fname") == 0
     my $extra_ccopt = "";
-    if ($DEBUG) {
+    if ($debug) {
         $extra_ccopt = "-Wall -Wno-unused-label -Wno-unused-variable -Wno-unused-but-set-variable -Werror";
     }
     system("$cc -o $exefile $extra_ccopt $fname") == 0 or die "$!\n";
@@ -561,6 +563,30 @@ sub gen_dfa ($) {
         nodes => \@dfa_nodes,
         nvec => $nfa->{nvec},
     };
+}
+
+sub calc_capture_mapping ($$) {
+    my ($from_node, $dfa_edge) = @_;
+    my $nfa_edges = $dfa_edge->{nfa_edges};
+    my $src_states = $from_node->{states};
+    my (@mappings, %assigned);
+    my $from_row = 0;
+    #warn "source state: ", join(",", @$src_states), " => ", gen_dfa_node_label($dfa_edge->{target}), "\n";
+    for my $src_state (@$src_states) {
+        my $to_row = 0;
+        for my $nfa_edge (@$nfa_edges) {
+            my $to_pc = $nfa_edge->[0];
+            my $key = "$src_state-$to_pc";
+            if (!$assigned{$to_row} && $nfa_paths{$key}) {
+                #warn "  mapping: $from_row => $to_row\n";
+                push @mappings, [$from_row, $to_row];
+                $assigned{$to_row} = 1;
+            }
+            $to_row++;
+        }
+        $from_row++;
+    }
+    $dfa_edge->{capture_mappings} = \@mappings;
 }
 
 sub gen_dfa_edges_for_asserts ($$$$$$) {
@@ -1310,9 +1336,9 @@ _EOC_
             $src .= "\n    {  /* DFA node $label */\n";
         }
 
-        $src .= qq{    fprintf(stderr, "entering state $label\\n");\n} if $DEBUG;
+        $src .= qq{    fprintf(stderr, "entering state $label\\n");\n} if $debug;
         $src .= "    c = i < len ? s[i++] : (i++, -1);\n";
-        $src .= qq{    fprintf(stderr, "reading new char \\"%d\\"\\n", c);\n} if $DEBUG;
+        $src .= qq{    fprintf(stderr, "reading new char \\"%d\\"\\n", c);\n} if $debug;
 
         my $first_time = 1;
         my $edges = $node->{edges};
@@ -1419,7 +1445,7 @@ main(void)
         }
     } while (1);
 
-    if ($DEBUG == 2) {
+    if ($debug == 2) {
         fprintf(stderr, "input string: %.*s\\n", (int) len, buf);
     }
 
@@ -1540,7 +1566,7 @@ sub gen_c_for_dfa_edge ($$$$) {
                 die "TODO";
             }
             $src .= $indent . qq{fprintf(stderr, "assertion $assert test result: %d, idx = $idx, i = %d, c = %d\\n", asserts, i, c);\n}
-                if $DEBUG;
+                if $debug;
         }
 
         my $assert_edges = $target->{edges};
@@ -1692,8 +1718,22 @@ sub usage ($) {
     my $rc = shift;
     my $msg = <<"_EOC_";
 Usage:
-    re.pl <regex> <string>
-    re.pl --stdin <regex> < input-file
+    re.pl [options] <regex> <string>
+    re.pl [options] --stdin <regex> < input-file
+
+Options:
+    --cc=NAME       specify the name of the C compiler used to compile
+                    the generated C code for the regex. a full path
+                    can be accepted too. default to "cc".
+
+    --debug=LEVEL   specify the debug output level; valid values are
+                    0, 1, and 2.
+
+    --help          show this usage.
+
+    --stdin         accept the subject string (to be matched) from the
+                    stdin device instead of the second command-line
+                    argument.
 _EOC_
     if ($rc) {
         warn $msg;
@@ -1708,28 +1748,4 @@ sub dump_code ($) {
     my $ln = 1;
     (my $str = $code) =~ s/^/sprintf("%3s ", $ln++)/gem;
     return $str;
-}
-
-sub calc_capture_mapping ($$) {
-    my ($from_node, $dfa_edge) = @_;
-    my $nfa_edges = $dfa_edge->{nfa_edges};
-    my $src_states = $from_node->{states};
-    my (@mappings, %assigned);
-    my $from_row = 0;
-    #warn "source state: ", join(",", @$src_states), " => ", gen_dfa_node_label($dfa_edge->{target}), "\n";
-    for my $src_state (@$src_states) {
-        my $to_row = 0;
-        for my $nfa_edge (@$nfa_edges) {
-            my $to_pc = $nfa_edge->[0];
-            my $key = "$src_state-$to_pc";
-            if (!$assigned{$to_row} && $nfa_paths{$key}) {
-                #warn "  mapping: $from_row => $to_row\n";
-                push @mappings, [$from_row, $to_row];
-                $assigned{$to_row} = 1;
-            }
-            $to_row++;
-        }
-        $from_row++;
-    }
-    $dfa_edge->{capture_mappings} = \@mappings;
 }
