@@ -11,6 +11,8 @@ use List::MoreUtils qw( uniq firstidx );
 use List::Util qw( first max );
 use Carp qw( croak carp );
 use Getopt::Long qw( GetOptions );
+use File::Temp qw( tempfile );
+use POSIX qw( tmpnam );
 
 sub add_nfa_edges ($$$$);
 sub gen_nfa_edge_label ($);
@@ -31,19 +33,22 @@ sub add_to_set ($$);
 sub remove_from_set ($$);
 sub gen_dfa_node_label ($);
 sub gen_dfa_edge_label ($$);
-sub gen_perl_from_dfa ($);
+sub gen_c_from_dfa ($);
 sub canon_range ($);
 sub usage ($);
 sub gen_dfa_edge ($$$$$);
 sub resolve_dfa_edge ($$$$$$$$);
 sub gen_dfa_edges_for_asserts ($$$$$$);
-sub gen_capture_handler_perl_code ($$$);
-sub gen_perl_for_dfa_edge ($$$);
+sub gen_capture_handler_c_code ($$$$);
+sub gen_c_for_dfa_edge ($$$$);
 sub dump_code ($);
 
 my $DEBUG = 0;
 
+my $cc = "cc";
+
 GetOptions("help|h",        \(my $help),
+           "cc=s",          \$cc,
            "stdin",         \(my $stdin))
    or die usage(1);
 
@@ -198,44 +203,47 @@ my $dfa = gen_dfa($nfa);
 draw_dfa($dfa) if $DEBUG;
 
 #exit;
-my $perl = gen_perl_from_dfa($dfa);
-warn dump_code($perl) if $DEBUG == 2;
-#warn length $perl;
+my $c = gen_c_from_dfa($dfa);
+warn dump_code($c) if $DEBUG == 2;
 #$begin = time;
-my $matcher = eval $perl;
-if ($@) {
-    die "failed to eval perl code: $@";
-}
-#$elapsed = time - $begin;
-#warn "Perl code loading done ($elapsed sec, length ", length($perl), ").\n";
-
 {
+    my ($fh, $fname) = tempfile(SUFFIX => '.c', UNLINK => 1);
+    #warn $fname;
+    print $fh $c;
+    close $fh;
+    my $exefile = tmpnam();
+    #system("cc -o $exefile -Wall -Wno-unused-label -Wno-unused-variable -Wno-unused-but-set-variable -Werror -O0 $fname") == 0
+    my $extra_ccopt = "";
+    if ($DEBUG) {
+        $extra_ccopt = "-Wall -Wno-unused-label -Wno-unused-variable -Wno-unused-but-set-variable -Werror";
+    }
+    system("$cc -o $exefile $extra_ccopt $fname") == 0 or die "$!\n";
+    my @cmd = ($exefile);
+
     #my $begin = time;
-    my $res = $matcher->($subject);
     #$elapsed = time - $begin;
     #warn "Perl code execution done ($elapsed sec).\n";
 
-    if (!defined $res) {
-        print "no match.\n";
-    } else {
-        print "matched: ";
-        my @bits;
-        for (my $i = 0; $i < @$res; $i += 2) {
-            my ($a, $b) = ($res->[$i], $res->[$i + 1]);
-            if (!defined $a) {
-                $a = -1;
-            }
-            if (!defined $b) {
-                $b = -1;
-            }
-            push @bits, "($a, $b)";
-        }
-        print join(" ", @bits) . "\n";
+    run3 \@cmd, \$subject, \(my $out), \(my $err);
+
+    my $rc = $?;
+
+    if ($err) {
+        print STDERR $err;
     }
+
+    unlink $exefile or die $!;
+
+    if (!defined $out) {
+        die "program crashed: $rc";
+    }
+
+    print $out;
 }
 
 sub gen_nfa () {
     my @nodes;
+    my $max_cap = 0;
     my $idx = 0;
     for my $bc (@bytecodes) {
         my $opcode = opcode($bc);
@@ -245,7 +253,13 @@ sub gen_nfa () {
                 $pc2assert{$idx} = $bc->[1];
                 $found = 1;
             }
+        } elsif ($opcode eq 'save') {
+            my $n = $bc->[1];
+            if ($n > $max_cap) {
+                $max_cap = $n;
+            }
         }
+
         $opcode = is_node($bc);
         if (defined $opcode || $idx == 0) {
             my $node = {
@@ -278,7 +292,10 @@ sub gen_nfa () {
         add_nfa_edges($node, $idx == 0 ? 0 : $idx + 1, \%visited, undef);
     }
 
-    return \@nodes;
+    return {
+        nodes => \@nodes,
+        nvec => $max_cap + 1,
+    }
 }
 
 sub draw_nfa ($) {
@@ -291,14 +308,16 @@ sub draw_nfa ($) {
         edge => $edge_attr,
     );
 
+    my $nfa_nodes = $nfa->{nodes};
+
     #$graph->as_dot("nfa.dot");
-    for my $node (@$nfa) {
+    for my $node (@$nfa_nodes) {
         my $idx = $node->{idx};
         $graph->add_node("n$idx", $node->{start} ? (color => 'orange') : (),
                          $node->{accept} ? (shape => 'doublecircle') : (),
                          label => $big ? '' : $idx || " $idx");
     }
-    for my $node (@$nfa) {
+    for my $node (@$nfa_nodes) {
         my $from_idx = $node->{idx};
         my $e_idx = 0;
         for my $e (@{ $node->{edges} }) {
@@ -463,8 +482,10 @@ sub escape_range_char ($) {
 sub gen_dfa ($) {
     my ($nfa) = @_;
 
+    my $nfa_nodes = $nfa->{nodes};
+
     my $dfa_node = {
-        nfa_nodes => [$nfa->[0]],
+        nfa_nodes => [$nfa_nodes->[0]],
         edges => undef,
         idx => 0,
         start => 1,
@@ -527,7 +548,10 @@ sub gen_dfa ($) {
         $i++;
     }
 
-    return \@dfa_nodes;
+    return {
+        nodes => \@dfa_nodes,
+        nvec => $nfa->{nvec},
+    };
 }
 
 sub gen_dfa_edges_for_asserts ($$$$$$) {
@@ -763,6 +787,8 @@ sub gen_dfa_edges ($$$$$$) {
         #warn "DFA edges: ", Dumper(\@dfa_edges);
     #}
 
+    #warn "One group";
+
     my %targets;
     for my $dfa_edge (@dfa_edges) {
         $dfa_edge = resolve_dfa_edge($from_node, $dfa_edge, \@accept_edges, \%targets,
@@ -835,7 +861,7 @@ sub resolve_dfa_edge ($$$$$$$$) {
         $nfa_nodes = [];
         for my $nfa_edge (@$nfa_edges) {
             my $nfa_idx = $nfa_edge->[-1];
-            my $nfa_node = first { $_->{idx} eq $nfa_idx } @$nfa;
+            my $nfa_node = first { $_->{idx} eq $nfa_idx } @{ $nfa->{nodes} };
             push @$nfa_nodes, $nfa_node;
         }
     }
@@ -850,6 +876,10 @@ sub resolve_dfa_edge ($$$$$$$$) {
         idx => $$idx_ref++,
         $is_accept ? (accept => 1) : (),
     };
+    #if ($target_dfa_node->{idx} == 319) {
+    #warn "from node: ", Dumper($from_node);
+    #die "dfa edge: ", Dumper($dfa_edge);
+    #}
     push @$dfa_nodes, $target_dfa_node;
     if (!defined $assert_info) {
         $dfa_node_hash->{$key} = $target_dfa_node;
@@ -1031,8 +1061,11 @@ sub dedup_nfa_edges ($) {
 sub gen_dfa_hash_key ($$) {
     my ($states, $dfa_edge) = @_;
     #carp "nfa edges: ", Dumper($nfa_edges);
-    return ($dfa_edge->{shadowing} ? '2-' : $dfa_edge->{shadowed} ? '1-' : '0-')
+    my $shadowing = $dfa_edge->{shadowing};
+    my $key = (defined $shadowing ? "2-" : $dfa_edge->{shadowed} ? '1-' : '0-')
            . join ",", @$states;
+    #warn $key;
+    return $key;
 }
 
 sub add_to_set ($$) {
@@ -1080,7 +1113,9 @@ sub draw_dfa ($) {
         edge => $edge_attr,
     );
 
-    for my $node (@$dfa) {
+    my $dfa_nodes = $dfa->{nodes};
+
+    for my $node (@$dfa_nodes) {
         my $idx = $node->{idx};
         my $label = gen_dfa_node_label($node);
         $graph->add_node("n$idx", $node->{start} ? (color => 'orange') : (),
@@ -1089,7 +1124,7 @@ sub draw_dfa ($) {
                          label => $big ? '' : $label || " " . $label);
     }
 
-    for my $node (@$dfa) {
+    for my $node (@$dfa_nodes) {
         my $from_idx = $node->{idx};
         for my $e (@{ $node->{edges} }) {
             my $label = gen_dfa_edge_label($node, $e);
@@ -1182,72 +1217,96 @@ sub escape_range ($$) {
     $s .= "]";
 }
 
-sub gen_perl_from_dfa ($) {
+sub gen_c_from_dfa ($) {
     my ($dfa) = @_;
 
     my $src = <<'_EOC_';
-use Data::Dumper;
+#include <stdlib.h>
+#include <stdio.h>
+#include <ctype.h>
 
-sub is_word_boundary ($$) {
-    my ($a, $b) = @_;
-    #warn "a = ", Dumper($a);
-    #warn "b = ", Dumper($b);
-    $a = (defined $a && chr($a) =~ /^\w$/ ? 1 : 0);
-    $b = (defined $b && chr($b) =~ /^\w$/ ? 1 : 0);
-    #warn "a' = ", Dumper($a);
-    #warn "b' = ", Dumper($b);
-    #warn "xor(a, b) = ", $a ^ $b;
-    return ($a ^ $b);
+
+#define u_char  unsigned char
+
+
+enum {
+    NO_MATCH = 0,
+    MATCHED  = 1,
+    BUFSIZE = 4096
+};
+
+
+static inline int
+is_word_boundary(int a, int b)
+{
+    a = (a != -1 && (isalnum(a) || a == '_'));
+    b = (b != -1 && (isalnum(b) || b == '_'));
+    return (a ^ b);
 }
 
-sub {
-    my $s = shift;
-    my @b = map { ord } split //, $s;
-    my $c;
-    my $i = 0;
-    my $asserts;
-    my $matched;
+
+static int
+match(const u_char *s, size_t len, int *ovec)
+{
+    int c;
+    int i = 0;
 _EOC_
+
+    my $nvec = $dfa->{nvec};
+    #die "nvec: $nvec";
+
+    {
+        for (my $i = 0; $i < $nvec; $i++) {
+            $src .= "    int matched_$i = -1;\n";
+        }
+    }
+
+    my $dfa_nodes = $dfa->{nodes};
 
     my $level = 1;
 
     my $max_threads = 0;
-    for my $node (@$dfa) {
+    for my $node (@$dfa_nodes) {
         my $n = @{ $node->{states} };
         if ($n > $max_threads) {
             $max_threads = $n;
         }
     }
 
-    my @vars;
+    $src .= "    /* for maximum $max_threads threads */\n";
     for (my $i = 0; $i < $max_threads; $i++) {
-        push @vars, "\$caps$i";
+        for (my $j = 0; $j < $nvec; $j++) {
+            my $var = "caps${i}_$j";
+            $src .= "    int $var = -1;\n";
+        }
     }
-    $src .= "    my (" . join(", ", @vars) . ") = ("
-            . join(", ", map { "[]" } 1..$max_threads) . ");\n";
 
-    for my $node (@$dfa) {
+    for my $node (@$dfa_nodes) {
         my $idx = $node->{idx};
-        if (defined $node->{assert_info}) {
+
+        if (defined $node->{assert_info} || $node->{accept}) {
             next;
         }
+
         my $label = gen_dfa_node_label($node);
-        $src .= "st$idx:  { # DFA node $label\n";
-        $src .= "    warn 'entering state $label';\n" if $DEBUG;
+        $label =~ s/\\n/ /g;
 
-        if ($node->{accept}) {
-            $src .= "    return \$matched;  # accept state\n    } # end state\n";
-            next;
+        if ($idx != 0) {
+            $src .= "\nst$idx: {  /* DFA node $label */\n";
+        } else {
+            $src .= "\n    {  /* DFA node $label */\n";
         }
 
-        $src .= "    \$c = \$b[\$i++];\n";
-        $src .= "    warn \"reading new char \", \$c || 'nil', \"\\n\";\n" if $DEBUG;
+        $src .= qq{    fprintf(stderr, "entering state $label\\n");\n} if $DEBUG;
+        $src .= "    c = i < len ? s[i++] : (i++, -1);\n";
+        $src .= qq{    fprintf(stderr, "reading new char \\"%d\\"\\n", c);\n} if $DEBUG;
 
         my $first_time = 1;
         my $edges = $node->{edges};
+        my $used_error;
         my $seen_accept;
         for my $edge (@$edges) {
-            my ($new_src, $to_accept) = gen_perl_for_dfa_edge($idx, $edge, $level);
+            my ($new_src, $to_accept) = gen_c_for_dfa_edge($idx, $edge, $level, $nvec);
 
             if ($to_accept) {
                 $seen_accept = 1;
@@ -1256,8 +1315,9 @@ _EOC_
             if ($first_time) {
                 undef $first_time;
                 if (!$seen_accept) {
+                    $used_error = 1;
                     $src .= <<_EOC_;
-    if (!defined \$c) {
+    if (c == -1) {
         goto st${idx}_error;
     }
 _EOC_
@@ -1267,7 +1327,7 @@ _EOC_
             $src .= $new_src;
 
             if ($to_accept) {
-                $src .= "    if (defined \$c) {\n";
+                $src .= "    if (c != -1) {\n";
                 $level++;
             }
         }
@@ -1277,21 +1337,108 @@ _EOC_
             $level--;
         }
 
-        $src .= <<_EOC_;
-    }  # end state
-st${idx}_error:
-    return \$matched;  # fallback
-_EOC_
+        $src .= "    }  /* end state */\n\n";
+
+        if ($used_error) {
+            $src .= "st${idx}_error:\n";
+        }
+
+        for (my $i = 0; $i < $nvec; $i++) {
+            $src .= "    ovec[$i] = matched_$i;\n";
+        }
+
+        $src .= "    return MATCHED;  /* fallback */\n";
     }
 
-    $src .= <<'_EOC_';
+    $src .= <<"_EOC_";
+}
+
+
+int
+main(void)
+{
+    int          ovec[$nvec];
+    char        *p, *buf;
+    size_t       len, bufsize, rest;
+
+    buf = malloc(BUFSIZE);
+    if (buf == NULL) {
+        perror("malloc");
+        exit(1);
+    }
+
+    p = buf;
+    len = 0;
+    bufsize = BUFSIZE;
+    rest = BUFSIZE;
+
+    do {
+        int rc;
+
+        rc = fread(p, 1, rest, stdin);
+        if (rc < rest) {
+            if (ferror(stdin)) {
+                perror("fread");
+                exit(1);
+            }
+
+            /* must have reached eof */
+            len += rc;
+            break;
+        }
+
+        /* rc == rest */
+
+        len += rc;
+        p += rc;
+
+        if (feof(stdin)) {
+            break;
+        }
+
+        /* grow the buffer */
+        rest = bufsize;
+        bufsize <<= 1;
+        buf = realloc(buf, bufsize);
+        if (buf == NULL) {
+            perror("malloc");
+            exit(1);
+        }
+    } while (1);
+
+    if ($DEBUG == 2) {
+        fprintf(stderr, "input string: %.*s\\n", (int) len, buf);
+    }
+
+    {
+        int rc;
+        rc = match((u_char *) buf, len, ovec);
+        if (rc == NO_MATCH) {
+            printf("no match.\\n");
+            return 0;
+        }
+    }
+
+    /* matched */
+
+    printf("matched:");
+    {
+        int i;
+
+        for (i = 0; i < $nvec; i += 2) {
+            printf(" (%d, %d)", ovec[i], ovec[i + 1]);
+        }
+    }
+    printf("\\n");
+
+    return 0;
 }
 _EOC_
     return $src;
 }
 
-sub gen_perl_for_dfa_edge ($$$) {
-    my ($from_node_idx, $edge, $level) = @_;
+sub gen_c_for_dfa_edge ($$$$) {
+    my ($from_node_idx, $edge, $level, $nvec) = @_;
 
     my $src = '';
     my @indents = (" " x (4 * $level), " " x (4 * ($level + 1)));
@@ -1308,9 +1455,9 @@ sub gen_perl_for_dfa_edge ($$$) {
         for (my $i = 0; $i < @$ranges; $i += 2) {
             my ($a, $b) = ($ranges->[$i], $ranges->[$i + 1]);
             if ($a == $b) {
-                push @cond, "\$c == $a";
+                push @cond, "c == $a";
             } else {
-                push @cond, "\$c >= $a && \$c <= $b";
+                push @cond, "c >= $a && c <= $b";
             }
         }
     }
@@ -1328,19 +1475,26 @@ sub gen_perl_for_dfa_edge ($$$) {
         my $sibling_assert_settings = $edge->{check_to_accept_sibling};
         if (defined $sibling_assert_settings) {
             my $indent = $indents[$indent_idx];
-            $src .= $indent . "if (\$asserts == $sibling_assert_settings) { return \$matched; }\n";
+            $src .= $indent . "if (asserts == $sibling_assert_settings) {\n";
+
+            for (my $i = 0; $i < $nvec; $i++) {
+                $src .= $indent . "    ovec[$i] = matched_$i;\n";
+            }
+
+            $src .= $indent . "    return MATCHED;\n";
+            $src .= $indent . "}\n";
 
         } else {
             my $shadowing = $edge->{shadowing};
             if (defined $shadowing) {
                 my $indent = $indents[$indent_idx];
-                $src .= $indent . "if (\$asserts != 1) { # shadowed DFA edge\n";
-                my ($inner, $to_accept) = gen_perl_for_dfa_edge($from_node_idx, $shadowing, $level + 2);
+                $src .= $indent . "if (asserts != 1) { /* shadowed DFA edge */\n";
+                my ($inner, $to_accept) = gen_c_for_dfa_edge($from_node_idx, $shadowing,
+                                                             $level + 2, $nvec);
                 if (defined $inner) {
                     $src .= $inner;
                 }
                 die if $to_accept;
-                #$src .= $indent . "    goto st${from_node_idx}_error;\n";
                 $src .= $indent . "}\n";
             }
         }
@@ -1350,30 +1504,29 @@ sub gen_perl_for_dfa_edge ($$$) {
     my $indent = $indents[$indent_idx];
     if (defined $assert_info) {
         my $asserts = $assert_info->{asserts};
-        $src .= $indent . "my \$asserts = 0;\n";
+        $src .= $indent . "int asserts = 0;\n";
         for my $assert (sort keys %$asserts) {
             my $idx = $asserts->{$assert};
             if ($assert eq '^') {
-                $src .= $indent . '$asserts |= ($i == 1 || $i >= 2 && $b[$i - 2] == 10? 1 : 0) << '
+                $src .= $indent . 'asserts |= (i == 1 || (i >= 2 && s[i - 2] == 10)) << '
                                    . "$idx;\n";
             } elsif ($assert eq '$') {
-                $src .= $indent . '$asserts |= (!defined $c || $c == 10 ? 1 : 0) << '
-                                   . "$idx;\n";
+                $src .= $indent . 'asserts |= (c == -1 || c == 10) << ' . "$idx;\n";
             } elsif ($assert eq '\b') {
-                $src .= $indent . '$asserts |= (is_word_boundary($i >= 2 ? $b[$i - 2] : undef, $c) ? 1 : 0) << '
+                $src .= $indent . 'asserts |= is_word_boundary(i >= 2 ? s[i - 2] : -1, c) << '
                                    . "$idx;\n";
             } elsif ($assert eq '\B') {
-                $src .= $indent . '$asserts |= (is_word_boundary($i >= 2 ? $b[$i - 2] : undef, $c) ? 0 : 1) << '
+                $src .= $indent . 'asserts |= !is_word_boundary(i >= 2 ? s[i - 2] : -1, c) << '
                                    . "$idx;\n";
             } elsif ($assert eq '\A') {
-                $src .= $indent . '$asserts |= ($i == 1 ? 1 : 0) << '
+                $src .= $indent . 'asserts |= (i == 1) << '
                                    . "$idx;\n";
             } elsif ($assert eq '\z') {
-                $src .= $indent . '$asserts |= (!defined $c? 1 : 0) << ' . "$idx;\n";
+                $src .= $indent . 'asserts |= (c == -1) << ' . "$idx;\n";
             } else {
                 die "TODO";
             }
-            $src .= $indent . "warn 'assertion $assert test result: ', \$asserts, \", idx = $idx, i = \$i, c = \$c\n\";\n"
+            $src .= $indent . qq{fprintf(stderr, "assertion $assert test result: %d, idx = $idx, i = %d, c = %d\\n", asserts, i, c);\n}
                 if $DEBUG;
         }
 
@@ -1385,16 +1538,14 @@ sub gen_perl_for_dfa_edge ($$$) {
             my $assert_settings = $subedge->{assert_settings};
             #die unless ref $assert_settings;
             my $target = $subedge->{target};
-            $src .= $indent . "if (\$asserts == $assert_settings) {\n";
+            $src .= $indent . "if (asserts == $assert_settings) {\n";
             my $indent2 = $indent . (" " x 4);
             if ($target->{accept}) {
                 $to_accept = 1;
             }
-            $src .= gen_capture_handler_perl_code($subedge, $target->{accept}, $indent2);
+            $src .= gen_capture_handler_c_code($subedge, $target->{accept}, $indent2, $nvec);
             my $to = $target->{idx};
-            if ($to_accept) {
-                #$src .= $indent2 . "return \$matched;\n";
-            } else {
+            if (!$to_accept) {
                 $src .= $indent2 . "goto st$to;\n";
             }
             $src .= $indent . "}\n";
@@ -1403,7 +1554,7 @@ sub gen_perl_for_dfa_edge ($$$) {
     } else {
         # normal DFA edge w/o assertions
 
-        $src .= gen_capture_handler_perl_code($edge, $to_accept, $indent);
+        $src .= gen_capture_handler_c_code($edge, $to_accept, $indent, $nvec);
 
         my $to = $target->{idx};
         if (!$to_accept) {
@@ -1423,25 +1574,18 @@ sub gen_perl_for_dfa_edge ($$$) {
     return $src, $to_accept;
 }
 
-sub gen_capture_handler_perl_code ($$$) {
-    my ($edge, $to_accept, $indent) = @_;
+sub gen_capture_handler_c_code ($$$$) {
+    my ($edge, $to_accept, $indent, $nvec) = @_;
 
     my $src = '';
     my $target = $edge->{target};
     my $mappings = $edge->{capture_mappings};
     my $target_actions = $edge->{nfa_edges};
 
-    my (@from_vars, @to_vars, @stores);
+    my (%to_save_rows, %overwritten, @stores, %to_be_stored);
     for my $mapping (@$mappings) {
         my ($from_row, $to_row) = @$mapping;
-        if ($to_accept) {
-            push @from_vars, "\$caps$from_row";
-            push @to_vars, "\$matched";
 
-        } elsif ($from_row != $to_row) {
-            push @from_vars, "\$caps$from_row";
-            push @to_vars, "\$caps$to_row";
-        }
         my $nfa_edge = $target_actions->[$to_row];
         for my $pc (@$nfa_edge) {
             my $bc = $bytecodes[$pc];
@@ -1449,22 +1593,78 @@ sub gen_capture_handler_perl_code ($$$) {
             if ($bcname eq 'save') {
                 my $id = $bc->[1];
                 if ($to_accept) {
-                    push @stores, "\$matched->\[$id] = \$i - 1;";
+                    push @stores, "matched_$id = i - 1;";
                 } else {
-                    push @stores, "\$caps$to_row->\[$id] = \$i - 1;";
+                    push @stores, "caps${to_row}_$id = i - 1;";
+                    $to_be_stored{"$to_row-$id"} = 1;
                 }
             } elsif ($bcname eq 'assert') {
                 #warn "TODO: assertions";
             }
         }
+
+        if (!$to_accept && $from_row != $to_row) {
+            if ($overwritten{$from_row}) {
+                $to_save_rows{$from_row} = 1;
+            }
+            if (!$to_be_stored{$to_row}) {
+                $overwritten{$to_row} = 1;
+            }
+        }
     }
 
-    if (@from_vars) {
-        if (@from_vars > 1) {
-            $src .= $indent . "(" . join(", ", @to_vars) . ") = ("
-                    . join(", ", map { "[\@$_]" } @from_vars) . ");\n";
-        } else {
-            $src .= $indent . $to_vars[0] . " = [\@" . $from_vars[0] . "];\n";
+    %overwritten = ();
+
+    my @transfers;
+    for my $mapping (@$mappings) {
+        my ($from_row, $to_row) = @$mapping;
+
+        if ($to_accept) {
+            my $t = $indent . "/* transfer caps from row $from_row to matched */\n";
+            for (my $i = 0; $i < $nvec; $i++) {
+                $t .= $indent . "matched_$i = caps${from_row}_$i;\n";
+            }
+            push @transfers, $t;
+
+        } elsif ($from_row != $to_row) {
+            my $t = $indent . "/* transfer caps from row $from_row to row $to_row */\n";
+            for (my $i = 0; $i < $nvec; $i++) {
+                if (!$to_be_stored{"$to_row-$i"}) {
+                    my $to_var = "caps${to_row}_$i";
+                    if ($to_save_rows{$to_row}) {
+                        $t .= $indent . "tmp${to_row}_$i = $to_var;\n";
+                    }
+                    my $from_var;
+                    if ($overwritten{$from_row} && !$to_be_stored{"$from_row-$i"}) {
+                        $from_var = "tmp${from_row}_$i";
+                    } else {
+                        $from_var = "caps${from_row}_$i";
+                    }
+                    $t .= $indent . "$to_var = $from_var;\n";
+                }
+            }
+            $overwritten{$to_row} = 1;
+            push @transfers, $t;
+        }
+
+    }
+
+    if (@transfers) {
+        if (%to_save_rows) {
+            $src .= $indent . "{\n";
+            my @tmp;
+            for my $row (sort keys %to_save_rows) {
+                for (my $i = 0; $i < $nvec; $i++) {
+                    if (!$to_be_stored{"$row-$i"}) {
+                        push @tmp, "tmp${row}_$i";
+                    }
+                }
+            }
+            $src .= $indent . "int " .  join(", ", @tmp) . ";\n";
+        }
+        $src .= join "", @transfers;
+        if (%to_save_rows) {
+            $src .= $indent . "}\n";
         }
     }
 
@@ -1493,7 +1693,7 @@ _EOC_
 sub dump_code ($) {
     my ($code) = @_;
     my $ln = 1;
-    (my $str = $code) =~ s/^/$ln++/gem;
+    (my $str = $code) =~ s/^/sprintf("%3s ", $ln++)/gem;
     return $str;
 }
 

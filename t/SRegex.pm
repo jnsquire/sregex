@@ -319,7 +319,7 @@ sub parse_perl_dfa_res ($$) {
     #warn "data: $data";
     my ($res, $err);
     #warn @opts;
-    my @cmd = ("./re.pl", "--stdin", $re);
+    my @cmd = ("./re.pl", "--cc=tcc", "--stdin", $re);
     #warn "command: @cmd";
 
     run3 \@cmd, \$data, \$res, \$err;
@@ -334,7 +334,9 @@ sub parse_perl_dfa_res ($$) {
         return 0;
     }
     if ($last =~ /^matched: (.+)/) {
-        return $1;
+        my $caps = $1;
+        $caps =~ s/( \(-1, -1\))+$//g;
+        return $caps;
     }
     #warn $res;
     #warn "Bad perl script output: $last";
