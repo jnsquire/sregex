@@ -43,7 +43,7 @@ sub gen_dfa_edge ($$$$$);
 sub resolve_dfa_edge ($$$$$$$$);
 sub gen_dfa_edges_for_asserts ($$$$$$);
 sub gen_capture_handler_c_code ($$$$);
-sub gen_c_from_dfa_edge ($$$$);
+sub gen_c_from_dfa_edge ($$$$$);
 sub gen_c_from_dfa_node ($$);
 sub dump_code ($);
 
@@ -1347,7 +1347,7 @@ _EOC_
             exit(2);
         }
         elapsed = (end.tv_sec - begin.tv_sec) * 1e3 + (end.tv_nsec - begin.tv_nsec) * 1e-6;
-        printf("sregex dfa: %.02lf ms elapsed: ", elapsed);
+        printf("sregex DFA proto: %.02lf ms elapsed: ", elapsed);
 _EOC_
     } else {
         $timing_code1 = '';
@@ -1558,7 +1558,7 @@ sub gen_c_from_dfa_node ($$) {
             my $chr = $a_ranges->[0];
 
             $b->{memchr} = 1;
-            my ($b_src) = gen_c_from_dfa_edge($idx, $b, $level, $nvec);
+            my ($b_src) = gen_c_from_dfa_edge($idx, $b, $level, $nvec, undef);
             delete $b->{memchr};
 
             $src .= <<_EOC_;
@@ -1584,7 +1584,7 @@ _EOC_
     c = $chr;
 _EOC_
             $a->{default_branch} = 1;
-            my ($a_src) = gen_c_from_dfa_edge($idx, $a, $level, $nvec);
+            my ($a_src) = gen_c_from_dfa_edge($idx, $a, $level, $nvec, undef);
             delete $a->{default_branch};
             $src .= $a_src;
 
@@ -1592,12 +1592,44 @@ _EOC_
         }
     }
 
+    my $use_switch;
+    if (@$edges >= 2) {
+        my $count = 0;
+        for my $edge (@$edges) {
+            my $ranges = $edge->{char_ranges};
+            if (defined $ranges) {
+                for (my $i = 0; $i < @$ranges; $i += 2) {
+                    my ($a, $b) = ($ranges->[0], $ranges->[1]);
+                    $count += $b - $a + 1;
+                    #if ($count > $threshold) {
+                    #last;
+                    #}
+                }
+                #if ($count <= $threshold) {
+                $edge->{use_case} = 1;
+                next;
+                #}
+            }
+            last;
+        }
+        if ($count >= 5) {
+            $use_switch = 1;
+        }
+    }
+
+    #undef $use_switch;
+
+    my $to_accept;
+
     if (@$edges) {
         if ($edges->[0]{to_accept}) {
             $src .= "    c = i < len ? s[i++] : (i++, -1);\n";
             if ($debug) {
-                $src .= qq{        fprintf(stderr, "reading new char \\"%d\\"\\n", c);\n};
+                $src .= qq{     fprintf(stderr, "reading new char \\"%d\\"\\n", c);\n};
             }
+
+            $to_accept = 1;
+
         } else {
             $src .= <<"_EOC_";
     if (unlikely(i >= len)) {
@@ -1615,9 +1647,14 @@ _EOC_
         }
     }
 
+    if (!$to_accept && $use_switch) {
+        $src .= "    switch (c) {\n";
+    }
+
     my $seen_accept;
     for my $edge (@$edges) {
-        my ($edge_src, $to_accept) = gen_c_from_dfa_edge($idx, $edge, $level, $nvec);
+        my $edge_src;
+        ($edge_src, $to_accept, $use_switch) = gen_c_from_dfa_edge($idx, $edge, $level, $nvec, $use_switch);
 
         $src .= $edge_src;
 
@@ -1627,6 +1664,9 @@ _EOC_
 
         if ($to_accept) {
             $src .= "    if (c != -1) {\n";
+            if ($use_switch) {
+                $src .= "        switch (c) {\n";
+            }
             $level++;
         }
     }
@@ -1634,6 +1674,7 @@ _EOC_
     if ($seen_accept) {
         $src .= "    }\n";
         $level--;
+
     }
 
 closing_state:
@@ -1653,8 +1694,8 @@ closing_state:
     return $src;
 }
 
-sub gen_c_from_dfa_edge ($$$$) {
-    my ($from_node_idx, $edge, $level, $nvec) = @_;
+sub gen_c_from_dfa_edge ($$$$$) {
+    my ($from_node_idx, $edge, $level, $nvec, $use_switch) = @_;
 
     my $src = '';
     my @indents = (" " x (4 * $level), " " x (4 * ($level + 1)));
@@ -1667,32 +1708,70 @@ sub gen_c_from_dfa_edge ($$$$) {
 
     #warn "to accept: $to_accept";
 
+    my $new_use_switch;
+    if ($use_switch && !$edge->{use_case}) {
+        $src .= $indents[$indent_idx] . "default:\n";
+        $src .= $indents[$indent_idx] . "    break;\n";
+        $src .= $indents[$indent_idx] . "}\n";
+        undef $use_switch;
+    } else {
+        $new_use_switch = $use_switch;
+    }
+
     my @cond;
     if (defined $ranges && !$edge->{shadowed}) {
         for (my $i = 0; $i < @$ranges; $i += 2) {
             my ($a, $b) = ($ranges->[$i], $ranges->[$i + 1]);
-            if ($a == $b) {
-                push @cond, "c == $a";
+            if ($use_switch) {
+                for my $c ($a .. $b) {
+                    push @cond, $c;
+                }
             } else {
-                push @cond, "c >= $a && c <= $b";
+                if ($a == $b) {
+                    push @cond, "c == $a";
+                } else {
+                    push @cond, "c >= $a && c <= $b";
+                }
             }
         }
     }
 
     if (@cond) {
-        my $cond;
-        if (@cond == 1) {
-            $cond = $cond[0];
-        } else {
-            $cond = join " || ", map { "($_)" } @cond;
-        }
+        if ($use_switch) {
+            if ($default_br) {
+                $src .= $indents[$indent_idx] . "default: {\n";
+                #$src .= $indents[$indent_idx] . "    /* " . join(", ", @cond) . " */\n";
+                undef $new_use_switch;
 
-        if ($default_br) {
-            $src .= $indents[$indent_idx] . "/* $cond */\n";
+            } else {
+                my $i = 0;
+                for my $cond (@cond) {
+                    $src .= $indents[$indent_idx] . "case $cond:";
+                    if (++$i == @cond) {
+                        $src .= " {\n";
+                    } else {
+                        $src .= "\n";
+                    }
+                }
+            }
+
+            $indent_idx++;
+
         } else {
-            $src .= $indents[$indent_idx] . "if ($cond) {\n";
+            my $cond;
+            if (@cond == 1) {
+                $cond = $cond[0];
+            } else {
+                $cond = join " || ", map { "($_)" } @cond;
+            }
+
+            if ($default_br) {
+                $src .= $indents[$indent_idx] . "/* $cond */\n";
+            } else {
+                $src .= $indents[$indent_idx] . "if ($cond) {\n";
+            }
+            $indent_idx++ if !$default_br;
         }
-        $indent_idx++ if !$default_br;
 
         my $sibling_assert_settings = $edge->{check_to_accept_sibling};
         if (defined $sibling_assert_settings) {
@@ -1712,7 +1791,7 @@ sub gen_c_from_dfa_edge ($$$$) {
                 my $indent = $indents[$indent_idx];
                 $src .= $indent . "if (asserts != 1) { /* shadowed DFA edge */\n";
                 my ($inner, $to_accept) = gen_c_from_dfa_edge($from_node_idx, $shadowing,
-                                                              $level + 2, $nvec);
+                                                              $level + 2, $nvec, $use_switch);
                 if (defined $inner) {
                     $src .= $inner;
                 }
@@ -1789,13 +1868,20 @@ sub gen_c_from_dfa_edge ($$$$) {
     }
 
     if (@cond) {
-        if (!$default_br) {
+        if (!$default_br && !$use_switch) {
             $indent_idx--;
-            $src .= $indents[$indent_idx] . ($default_br ? "/* " : "") . "}\n";
+            $src .= $indents[$indent_idx] . "}\n";
+        } elsif ($use_switch) {
+            $src .= $indents[$indent_idx] . "break;\n";
+            $src .= $indents[$indent_idx] . "}\n";
+            $indent_idx--;
+            if (!$new_use_switch) {
+                $src .= $indents[$indent_idx] . "}\n";
+            }
         }
     }
 
-    return $src, $to_accept;
+    return $src, $to_accept, $new_use_switch;
 }
 
 sub gen_capture_handler_c_code ($$$$) {
