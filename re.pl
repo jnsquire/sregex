@@ -873,6 +873,7 @@ sub gen_dfa_edges ($$$$$$) {
                 push @total_ranges, @$range;
             }
         }
+
         if (@total_ranges) {
             canon_range(\@total_ranges);
             #warn "canon total range: @total_ranges";
@@ -1361,7 +1362,15 @@ _EOC_
 #include <string.h>
 
 
-#define u_char  unsigned char
+#if __GNUC__ > 3
+#    define likely(x)       __builtin_expect((x),1)
+#    define unlikely(x)     __builtin_expect((x),0)
+#else
+#    define likely(x)      (x)
+#    define unlikely(x)    (x)
+#endif
+
+#define u_char          unsigned char
 
 
 enum {
@@ -1519,31 +1528,39 @@ _EOC_
             $src .= "\n    {  /* DFA node $label */\n";
         }
 
-        $src .= qq{    fprintf(stderr, "entering state $label\\n");\n} if $debug;
-        $src .= "    c = i < len ? s[i++] : (i++, -1);\n";
-        $src .= qq{    fprintf(stderr, "reading new char \\"%d\\"\\n", c);\n} if $debug;
-
-        my $first_time = 1;
         my $edges = $node->{edges};
+
+        $src .= qq{    fprintf(stderr, "entering state $label\\n");\n} if $debug;
+
         my $used_error;
+
+        if (@$edges && $edges->[0]{to_accept}) {
+            $src .= "    c = i < len ? s[i++] : (i++, -1);\n";
+            if ($debug) {
+                $src .= qq{        fprintf(stderr, "reading new char \\"%d\\"\\n", c);\n};
+            }
+        } elsif (@$edges) {
+            $src .= <<"_EOC_";
+    if (unlikely(i >= len)) {
+        i++;
+        goto st${idx}_error;
+    }
+
+    c = s[i++];
+_EOC_
+            $used_error = 1;
+
+            if ($debug) {
+                $src .= qq{    fprintf(stderr, "reading new char \\"%d\\"\\n", c);\n};
+            }
+        }
+
         my $seen_accept;
         for my $edge (@$edges) {
             my ($new_src, $to_accept) = gen_c_for_dfa_edge($idx, $edge, $level, $nvec);
 
             if ($to_accept) {
                 $seen_accept = 1;
-            }
-
-            if ($first_time) {
-                undef $first_time;
-                if (!$seen_accept) {
-                    $used_error = 1;
-                    $src .= <<_EOC_;
-    if (c == -1) {
-        goto st${idx}_error;
-    }
-_EOC_
-                }
             }
 
             $src .= $new_src;
