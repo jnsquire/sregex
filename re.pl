@@ -1544,24 +1544,74 @@ sub gen_c_from_dfa_node ($$) {
 
     my $used_error;
 
-    if (@$edges && $edges->[0]{to_accept}) {
-        $src .= "    c = i < len ? s[i++] : (i++, -1);\n";
-        if ($debug) {
-            $src .= qq{        fprintf(stderr, "reading new char \\"%d\\"\\n", c);\n};
+    if (@$edges == 2) {
+        my ($a, $b) = @$edges;
+        my $a_ranges = $a->{char_ranges};
+        if (!$a->{to_accept}
+            && @$a_ranges == 2
+            && $a_ranges->[0] == $a_ranges->[1]
+            && !defined $a->{target}{assert_info}
+            && $b->{default_branch}
+            && $b->{target} eq $node)
+        {
+            #warn "HIT: $re: $idx: ", gen_dfa_edge_label($node, $a);
+            my $chr = $a_ranges->[0];
+
+            $b->{memchr} = 1;
+            my ($b_src) = gen_c_from_dfa_edge($idx, $b, $level, $nvec);
+            delete $b->{memchr};
+
+            $src .= <<_EOC_;
+    {
+        /* shortcut: search for a single char */
+        const u_char *p;
+
+        p = (const u_char *) memchr(s + i, $chr, len - i);
+        if (unlikely(p == NULL)) {
+            i = len;
+            goto st${idx}_error;
         }
-    } elsif (@$edges) {
-        $src .= <<"_EOC_";
-if (unlikely(i >= len)) {
-    i++;
-    goto st${idx}_error;
-}
 
-c = s[i++];
+        i = p - s;
+    }
 _EOC_
-        $used_error = 1;
+            $used_error = 1;
 
-        if ($debug) {
-            $src .= qq{    fprintf(stderr, "reading new char \\"%d\\"\\n", c);\n};
+            $src .= $b_src;
+
+            $src .= <<_EOC_;
+    i++;
+    c = $chr;
+_EOC_
+            $a->{default_branch} = 1;
+            my ($a_src) = gen_c_from_dfa_edge($idx, $a, $level, $nvec);
+            delete $a->{default_branch};
+            $src .= $a_src;
+
+            goto closing_state;
+        }
+    }
+
+    if (@$edges) {
+        if ($edges->[0]{to_accept}) {
+            $src .= "    c = i < len ? s[i++] : (i++, -1);\n";
+            if ($debug) {
+                $src .= qq{        fprintf(stderr, "reading new char \\"%d\\"\\n", c);\n};
+            }
+        } else {
+            $src .= <<"_EOC_";
+    if (unlikely(i >= len)) {
+        i++;
+        goto st${idx}_error;
+    }
+
+    c = s[i++];
+_EOC_
+            $used_error = 1;
+
+            if ($debug) {
+                $src .= qq{    fprintf(stderr, "reading new char \\"%d\\"\\n", c);\n};
+            }
         }
     }
 
@@ -1585,6 +1635,8 @@ _EOC_
         $src .= "    }\n";
         $level--;
     }
+
+closing_state:
 
     $src .= "    }  /* end state */\n\n";
 
@@ -1727,7 +1779,7 @@ sub gen_c_from_dfa_edge ($$$$) {
         $src .= gen_capture_handler_c_code($edge, $to_accept, $indent, $nvec);
 
         my $to = $target->{idx};
-        if (!$to_accept) {
+        if (!$to_accept && !$edge->{memchr}) {
             if (!defined $to) {
                 warn Dumper($edge);
                 croak Dumper($target);
