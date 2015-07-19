@@ -44,6 +44,7 @@ sub resolve_dfa_edge ($$$$$$$$);
 sub gen_dfa_edges_for_asserts ($$$$$$);
 sub gen_capture_handler_c_code ($$$$);
 sub gen_c_from_dfa_edge ($$$$);
+sub gen_c_from_dfa_node ($$);
 sub dump_code ($);
 
 my $cc = "cc";
@@ -1494,8 +1495,6 @@ _EOC_
 
     my $dfa_nodes = $dfa->{nodes};
 
-    my $level = 1;
-
     my $max_threads = 0;
     for my $node (@$dfa_nodes) {
         my $n = @{ $node->{states} };
@@ -1513,84 +1512,92 @@ _EOC_
     }
 
     for my $node (@$dfa_nodes) {
-        my $idx = $node->{idx};
-
-        if (defined $node->{assert_info} || $node->{accept}) {
-            next;
-        }
-
-        my $label = gen_dfa_node_label($node);
-        $label =~ s/\\n/ /g;
-
-        if ($idx != 0) {
-            $src .= "\nst$idx: {  /* DFA node $label */\n";
-        } else {
-            $src .= "\n    {  /* DFA node $label */\n";
-        }
-
-        my $edges = $node->{edges};
-
-        $src .= qq{    fprintf(stderr, "entering state $label\\n");\n} if $debug;
-
-        my $used_error;
-
-        if (@$edges && $edges->[0]{to_accept}) {
-            $src .= "    c = i < len ? s[i++] : (i++, -1);\n";
-            if ($debug) {
-                $src .= qq{        fprintf(stderr, "reading new char \\"%d\\"\\n", c);\n};
-            }
-        } elsif (@$edges) {
-            $src .= <<"_EOC_";
-    if (unlikely(i >= len)) {
-        i++;
-        goto st${idx}_error;
+        next if defined $node->{assert_info} || $node->{accept};
+        $src .= gen_c_from_dfa_node($node, $nvec);
     }
 
-    c = s[i++];
-_EOC_
-            $used_error = 1;
-
-            if ($debug) {
-                $src .= qq{    fprintf(stderr, "reading new char \\"%d\\"\\n", c);\n};
-            }
-        }
-
-        my $seen_accept;
-        for my $edge (@$edges) {
-            my ($new_src, $to_accept) = gen_c_from_dfa_edge($idx, $edge, $level, $nvec);
-
-            if ($to_accept) {
-                $seen_accept = 1;
-            }
-
-            $src .= $new_src;
-
-            if ($to_accept) {
-                $src .= "    if (c != -1) {\n";
-                $level++;
-            }
-        }
-
-        if ($seen_accept) {
-            $src .= "    }\n";
-            $level--;
-        }
-
-        $src .= "    }  /* end state */\n\n";
-
-        if ($used_error) {
-            $src .= "st${idx}_error:\n";
-        }
-
-        for (my $i = 0; $i < $nvec; $i++) {
-            $src .= "    ovec[$i] = matched_$i;\n";
-        }
-
-        $src .= "    return MATCHED;  /* fallback */\n";
-    }
     $src .= <<"_EOC_";
 }
 _EOC_
+    return $src;
+}
+
+sub gen_c_from_dfa_node ($$) {
+    my ($node, $nvec) = @_;
+    my $idx = $node->{idx};
+
+    my $level = 1;
+    my $src = '';
+
+    my $label = gen_dfa_node_label($node);
+    $label =~ s/\\n/ /g;
+
+    if ($idx != 0) {
+        $src .= "\nst$idx: {  /* DFA node $label */\n";
+    } else {
+        $src .= "\n    {  /* DFA node $label */\n";
+    }
+
+    my $edges = $node->{edges};
+
+    $src .= qq{    fprintf(stderr, "entering state $label\\n");\n} if $debug;
+
+    my $used_error;
+
+    if (@$edges && $edges->[0]{to_accept}) {
+        $src .= "    c = i < len ? s[i++] : (i++, -1);\n";
+        if ($debug) {
+            $src .= qq{        fprintf(stderr, "reading new char \\"%d\\"\\n", c);\n};
+        }
+    } elsif (@$edges) {
+        $src .= <<"_EOC_";
+if (unlikely(i >= len)) {
+    i++;
+    goto st${idx}_error;
+}
+
+c = s[i++];
+_EOC_
+        $used_error = 1;
+
+        if ($debug) {
+            $src .= qq{    fprintf(stderr, "reading new char \\"%d\\"\\n", c);\n};
+        }
+    }
+
+    my $seen_accept;
+    for my $edge (@$edges) {
+        my ($edge_src, $to_accept) = gen_c_from_dfa_edge($idx, $edge, $level, $nvec);
+
+        $src .= $edge_src;
+
+        if ($to_accept) {
+            $seen_accept = 1;
+        }
+
+        if ($to_accept) {
+            $src .= "    if (c != -1) {\n";
+            $level++;
+        }
+    }
+
+    if ($seen_accept) {
+        $src .= "    }\n";
+        $level--;
+    }
+
+    $src .= "    }  /* end state */\n\n";
+
+    if ($used_error) {
+        $src .= "st${idx}_error:\n";
+    }
+
+    for (my $i = 0; $i < $nvec; $i++) {
+        $src .= "    ovec[$i] = matched_$i;\n";
+    }
+
+    $src .= "    return MATCHED;  /* fallback */\n";
+
     return $src;
 }
 
