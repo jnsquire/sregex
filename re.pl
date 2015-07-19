@@ -43,7 +43,7 @@ sub gen_dfa_edge ($$$$$);
 sub resolve_dfa_edge ($$$$$$$$);
 sub gen_dfa_edges_for_asserts ($$$$$$);
 sub gen_capture_handler_c_code ($$$$);
-sub gen_c_for_dfa_edge ($$$$);
+sub gen_c_from_dfa_edge ($$$$);
 sub dump_code ($);
 
 my $cc = "cc";
@@ -1557,7 +1557,7 @@ _EOC_
 
         my $seen_accept;
         for my $edge (@$edges) {
-            my ($new_src, $to_accept) = gen_c_for_dfa_edge($idx, $edge, $level, $nvec);
+            my ($new_src, $to_accept) = gen_c_from_dfa_edge($idx, $edge, $level, $nvec);
 
             if ($to_accept) {
                 $seen_accept = 1;
@@ -1594,7 +1594,7 @@ _EOC_
     return $src;
 }
 
-sub gen_c_for_dfa_edge ($$$$) {
+sub gen_c_from_dfa_edge ($$$$) {
     my ($from_node_idx, $edge, $level, $nvec) = @_;
 
     my $src = '';
@@ -1652,8 +1652,8 @@ sub gen_c_for_dfa_edge ($$$$) {
             if (defined $shadowing) {
                 my $indent = $indents[$indent_idx];
                 $src .= $indent . "if (asserts != 1) { /* shadowed DFA edge */\n";
-                my ($inner, $to_accept) = gen_c_for_dfa_edge($from_node_idx, $shadowing,
-                                                             $level + 2, $nvec);
+                my ($inner, $to_accept) = gen_c_from_dfa_edge($from_node_idx, $shadowing,
+                                                              $level + 2, $nvec);
                 if (defined $inner) {
                     $src .= $inner;
                 }
