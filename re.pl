@@ -1612,7 +1612,7 @@ _EOC_
             }
             last;
         }
-        if ($count >= 5) {
+        if ($count >= 5 && $count <= 30) {
             $use_switch = 1;
         }
     }
@@ -1669,6 +1669,10 @@ _EOC_
             }
             $level++;
         }
+    }
+
+    if ($use_switch) {
+        $src .= "    default:\n        break;\n    }\n";
     }
 
     if ($seen_accept) {
