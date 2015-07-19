@@ -319,7 +319,7 @@ sub parse_perl_dfa_res ($$) {
     #warn "data: $data";
     my ($res, $err);
     #warn @opts;
-    my @cmd = ("./re.pl", "--cc=tcc", "--stdin", $re);
+    my @cmd = ("./re.pl", "--debug=0", "--cc=tcc", "--stdin", $re);
     #warn "command: @cmd";
 
     run3 \@cmd, \$data, \$res, \$err;
