@@ -1612,7 +1612,7 @@ _EOC_
             }
             last;
         }
-        if ($count >= 5 && $count <= 30) {
+        if ($count >= 5 && $count <= 210) {
             $use_switch = 1;
         }
     }
