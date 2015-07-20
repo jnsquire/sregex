@@ -16,6 +16,7 @@ use Getopt::Long qw( GetOptions );
 use File::Temp qw( tempfile );
 use POSIX qw( tmpnam );
 use File::Spec ();
+use FindBin ();
 
 sub add_nfa_edges ($$$$);
 sub gen_nfa_edge_label ($);
@@ -1346,6 +1347,12 @@ sub gen_c_from_dfa ($) {
         $global = 0;
     }
 
+    my $infile = "$FindBin::Bin/bench/getcputime.h";
+    open my $in, $infile
+        or die "cannot open $infile for reading: $!\n";
+    my $getcputime = do { local $/; <$in> };
+    close $in;
+
     my $src = <<_EOC_;
 #include <stdlib.h>
 #include <stdio.h>
@@ -1354,6 +1361,7 @@ sub gen_c_from_dfa ($) {
 #include <time.h>
 #include <string.h>
 
+$getcputime
 
 #if __GNUC__ > 3
 #    define likely(x)       __builtin_expect((x),1)
@@ -1450,16 +1458,16 @@ main(void)
         size_t      rest;
 
         for (i = 0; i < $repeat; i++) {
-            double               elapsed;
-            struct timespec      begin, end;
+            double               elapsed, begin, end;
 
             matches = 0;
             p = buf;
             rest = len;
 
             if ($timer) {
-                if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &begin) == -1) {
-                    perror("clock_gettime");
+                begin = get_cpu_time();
+                if (begin == -1) {
+                    perror("get_cpu_time");
                     exit(2);
                 }
             }
@@ -1476,12 +1484,12 @@ main(void)
             } while (global && rc > 0);
 
             if ($timer) {
-                if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &end) == -1) {
-                    perror("clock_gettime");
+                end = get_cpu_time();
+                if (end == -1) {
+                    perror("get_cpu_time");
                     exit(2);
                 }
-                elapsed = (end.tv_sec - begin.tv_sec) * 1e3
-                           + (end.tv_nsec - begin.tv_nsec) * 1e-6;
+                elapsed = end - begin;
 
                 if (i == 0 || elapsed < best) {
                     best = elapsed;
@@ -1502,7 +1510,7 @@ main(void)
 
     if (best != -1) {
         printf(": %.02lf ms elapsed (%d matches found, $repeat repeated times).\\n",
-               best, matches);
+               best * 1e3, matches);
 
     } else {
         printf("\\n");
