@@ -52,14 +52,27 @@ my $debug = 0;
 
 GetOptions("help|h",        \(my $help),
            "cc=s",          \$cc,
+           "repeat=i",      \(my $repeat),
            "debug=i",       \$debug,
+           "g",             \(my $global),
            "out|o=s",       \(my $exefile),
-           "timing",        \(my $timing),
+           "timer",         \(my $timer),
            "stdin",         \(my $stdin))
    or die usage(1);
 
 if ($help) {
     usage(0);
+}
+
+if (!$timer) {
+    if (defined $repeat) {
+        warn "WARNING: --repeat is ignored because --timer is not specified.\n";
+    }
+    $repeat = 1;
+    $timer = 0;
+
+} elsif (!$repeat) {
+    $repeat = 5;
 }
 
 $Data::Dumper::Terse = 1;
@@ -1329,29 +1342,8 @@ sub gen_c_from_dfa ($) {
     my $nvec = $dfa->{nvec};
     #die "nvec: $nvec";
 
-    my ($timing_code1, $timing_code2);
-    if ($timing) {
-        $timing_code1 = <<'_EOC_';
-        double               elapsed;
-        struct timespec      begin, end;
-
-        if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &begin) == -1) {
-            perror("clock_gettime");
-            exit(2);
-        }
-_EOC_
-
-        $timing_code2 = <<'_EOC_';
-        if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &end) == -1) {
-            perror("clock_gettime");
-            exit(2);
-        }
-        elapsed = (end.tv_sec - begin.tv_sec) * 1e3 + (end.tv_nsec - begin.tv_nsec) * 1e-6;
-        printf("sregex DFA proto: %.02lf ms elapsed: ", elapsed);
-_EOC_
-    } else {
-        $timing_code1 = '';
-        $timing_code2 = '';
+    if (!$global) {
+        $global = 0;
     }
 
     my $src = <<_EOC_;
@@ -1396,9 +1388,10 @@ is_word_boundary(int a, int b)
 int
 main(void)
 {
-    int          ovec[$nvec];
+    int          i, rc, ovec[$nvec], global = $global, matches;
     char        *p, *buf;
     size_t       len, bufsize, rest;
+    double       best = -1;
 
     buf = malloc(BUFSIZE);
     if (buf == NULL) {
@@ -1412,8 +1405,6 @@ main(void)
     rest = BUFSIZE;
 
     do {
-        int rc;
-
         rc = fread(p, 1, rest, stdin);
         if (rc < rest) {
             if (ferror(stdin)) {
@@ -1451,30 +1442,71 @@ main(void)
         fprintf(stderr, "input string: %.*s\\n", (int) len, buf);
     }
 
-    memset(ovec, -1, sizeof(ovec)/sizeof(ovec[0]));
+    printf("SRegex DFA proto ");
+
+    /* memset(ovec, -1, sizeof(ovec)/sizeof(ovec[0])); */
 
     {
-        int rc;
-$timing_code1
-        rc = match((u_char *) buf, len, ovec);
-$timing_code2
-        if (rc == NO_MATCH || (ovec[0] == -1 && ovec[1] == -1)) {
-            printf("no match.\\n");
-            return 0;
+        size_t      rest;
+
+        for (i = 0; i < $repeat; i++) {
+            double               elapsed;
+            struct timespec      begin, end;
+
+            matches = 0;
+            p = buf;
+            rest = len;
+
+            if ($timer) {
+                if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &begin) == -1) {
+                    perror("clock_gettime");
+                    exit(2);
+                }
+            }
+
+            do {
+                rc = match((u_char *) p, rest, ovec);
+
+                if (rc > 0) {
+                    matches++;
+                    p += ovec[1];
+                    rest -= ovec[1];
+                }
+
+            } while (global && rc > 0);
+
+            if ($timer) {
+                if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &end) == -1) {
+                    perror("clock_gettime");
+                    exit(2);
+                }
+                elapsed = (end.tv_sec - begin.tv_sec) * 1e3
+                           + (end.tv_nsec - begin.tv_nsec) * 1e-6;
+
+                if (i == 0 || elapsed < best) {
+                    best = elapsed;
+                }
+            }
         }
     }
 
-    /* matched */
+    if (rc == NO_MATCH) {
+        printf("no match");
 
-    printf("matched:");
-    {
-        int i;
-
+    } else {
+        printf("match");
         for (i = 0; i < $nvec; i += 2) {
             printf(" (%d, %d)", ovec[i], ovec[i + 1]);
         }
     }
-    printf("\\n");
+
+    if (best != -1) {
+        printf(": %.02lf ms elapsed (%d matches found, $repeat repeated times).\\n",
+               best, matches);
+
+    } else {
+        printf("\\n");
+    }
 
     return 0;
 }
@@ -1545,6 +1577,7 @@ sub gen_c_from_dfa_node ($$) {
     my $used_error;
 
     if (@$edges == 2) {
+        # try to apply memchr optimization
         my ($a, $b) = @$edges;
         my $a_ranges = $a->{char_ranges};
         if (!$a->{to_accept}
@@ -1594,6 +1627,7 @@ _EOC_
 
     my $use_switch;
     if (@$edges >= 2) {
+        # try to apply switch/case optimization
         my $count = 0;
         for my $edge (@$edges) {
             my $ranges = $edge->{char_ranges};
@@ -1612,7 +1646,7 @@ _EOC_
             }
             last;
         }
-        if ($count >= 5 && $count <= 210) {
+        if ($count >= 5 && $count < 230) {
             $use_switch = 1;
         }
     }
@@ -2017,12 +2051,17 @@ Options:
     --debug=LEVEL   specify the debug output level; valid values are
                     0, 1, and 2.
 
+    -g              perform global search (similar to Perl's /g mode).
+
     --help          show this usage.
 
     --out=FILE      specify the output executable file generated by the
                     C compiler.
 
-    --timing        insert timing code for the match routine in the compiled
+    --repeat=N      repeat the operations for N times (default to 3) and pick
+                    the best result. only effective when --timer is specified.
+
+    --timer         insert timer code for the match routine in the compiled
                     program.
 
     --stdin         accept the subject string (to be matched) from the
