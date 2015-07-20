@@ -12,7 +12,7 @@ use Test::LongString;
 sub run_test ($);
 sub parse_res ($);
 sub fmt_cap ($$);
-sub parse_perl_dfa_res ($$);
+sub parse_sregex_dfa_res ($$);
 
 
 our @EXPORT = qw( run_tests );
@@ -241,15 +241,15 @@ sub run_test ($) {
                 }
 
                 if (!@opts) {
-                    my $res = parse_perl_dfa_res($re, $stdin);
+                    my $res = parse_sregex_dfa_res($re, $stdin);
 
                     if (defined $block->no_match) {
-                        is($res, 0, "$name - perl dfa vm should not match");
+                        is($res, 0, "$name - sregex dfa vm should not match");
                     } else {
-                        isnt($res, 0, "$name - perl dfa vm should match");
+                        isnt($res, 0, "$name - sregex dfa vm should match");
                     }
 
-                    is($res, $expected_cap, "$name - perl dfa vm capture ok");
+                    is($res, $expected_cap, "$name - sregex dfa vm capture ok");
                 }
 
             } elsif ($s =~ m/$prefix$re/sm) {
@@ -282,15 +282,15 @@ sub run_test ($) {
                 }
 
                 if (!@opts) {
-                    my $res = parse_perl_dfa_res($re, $stdin);
+                    my $res = parse_sregex_dfa_res($re, $stdin);
 
                     if (defined $block->no_match) {
-                        is($res, 0, "$name - perl dfa vm should not match");
+                        is($res, 0, "$name - sregex dfa vm should not match");
                     } else {
-                        isnt($res, 0, "$name - perl dfa vm should match");
+                        isnt($res, 0, "$name - sregex dfa vm should match");
                     }
 
-                    is($res, $expected_cap, "$name - perl dfa vm capture ok");
+                    is($res, $expected_cap, "$name - sregex dfa vm capture ok");
                 }
 
             } else {
@@ -314,7 +314,7 @@ sub run_test ($) {
     }
 }
 
-sub parse_perl_dfa_res ($$) {
+sub parse_sregex_dfa_res ($$) {
     my ($re, $data) = @_;
     #warn "data: $data";
     my ($res, $err);
@@ -330,7 +330,7 @@ sub parse_perl_dfa_res ($$) {
     #warn scalar @lines;
     my $last = pop @lines;
     #warn "last: $last";
-    if ($last =~ /^nomatch/) {
+    if ($last =~ /^no match/) {
         return 0;
     }
     if ($last =~ /^matched: (.+)/) {
