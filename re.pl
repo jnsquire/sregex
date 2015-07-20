@@ -47,6 +47,7 @@ sub gen_capture_handler_c_code ($$$$);
 sub gen_c_from_dfa_edge ($$$$$);
 sub gen_c_from_dfa_node ($$);
 sub dump_code ($);
+sub count_chars_in_ranges ($);
 
 my $cc = "cc";
 my $debug = 0;
@@ -107,8 +108,20 @@ if ($stdin) {
 
 #die "subject: $subject";
 
-my @cmd = ("./sregex-cli", $re);
+my @opts;
+# a hack to work-around the lack of support of (?i) in the sregex frontend.
+if ($re =~ s/^\(\?i\)//) {
+    push @opts, "--flags", "i";
+}
+my @cmd = ("$FindBin::Bin/sregex-cli", @opts, $re);
 run3 \@cmd, undef, \(my $res), \(my $err);
+
+if (!$res) {
+    if ($err) {
+        warn $err;
+    }
+    die "sregex-cli crashed.\n";
+}
 
 warn "$res" if $debug;
 open my $in, "<", \$res or die $!;
@@ -242,7 +255,7 @@ warn dump_code($c) if $debug == 2;
 
     #system("cc -o $exefile -Wall -Wno-unused-label -Wno-unused-variable -Wno-unused-but-set-variable -Werror -O0 $fname") == 0
     my $extra_ccopt = "";
-    if ($debug) {
+    if ($debug && $cc =~ /\bgcc\b/) {
         $extra_ccopt = "-Wall -Wno-unused-label -Wno-unused-variable -Wno-unused-but-set-variable -Werror";
     }
 
@@ -583,9 +596,18 @@ sub gen_dfa ($) {
             $dfa_node->{edges} = $dfa_edges;
         }
 
-        # fix the path mappings in the DFA edges
+        # fix the path mappings in the DFA edges.
 
+        #warn "[0] edges for node ", $dfa_node->{idx}, ": ", scalar @$dfa_edges;
         for my $dfa_edge (@$dfa_edges) {
+            #my $ranges = $dfa_edge->{char_ranges};
+            #if (defined $ranges) {
+                #warn "[0] check edge ", gen_dfa_edge_label($dfa_node, $dfa_edge), " w/ ",
+                    #scalar @$ranges, " ranges";
+                #warn "ranges: @$ranges";
+                #canon_range($ranges);
+            #}
+
             calc_capture_mapping($dfa_node, $dfa_edge);
             my $shadowing = $dfa_edge->{shadowing};
             if (defined $shadowing) {
@@ -874,11 +896,19 @@ sub gen_dfa_edges ($$$$$$) {
     }
 
     @dfa_edges = grep { defined } @dfa_edges;
-    @dfa_edges = sort {
-        my $n1 = defined $a->{char_ranges} ? @{ $a->{char_ranges} } : 0;
-        my $n2 = defined $b->{char_ranges} ? @{ $b->{char_ranges} } : 0;
-        $n1 <=> $n2;
-    } @dfa_edges;
+
+    #warn "count chars in edges";
+    for my $dfa_edge (@dfa_edges) {
+        $dfa_edge->{nchars} = count_chars_in_ranges($dfa_edge->{char_ranges});
+        #warn "nchars: ", $dfa_edge->{nchars};
+    }
+
+    @dfa_edges = sort { $a->{nchars} <=> $b->{nchars} } @dfa_edges;
+
+    #warn "show char count in shorted edges";
+    #for my $dfa_edge (@dfa_edges) {
+        #warn "nchars: ", $dfa_edge->{nchars};
+    #}
 
     {
         my @total_ranges;
@@ -1446,9 +1476,11 @@ main(void)
         p = buf + len;
     } while (1);
 
+    /*
     if ($debug == 2) {
         fprintf(stderr, "input string: %.*s\\n", (int) len, buf);
     }
+    */
 
     printf("SRegex DFA proto ");
 
@@ -1637,24 +1669,26 @@ _EOC_
     if (@$edges >= 2) {
         # try to apply switch/case optimization
         my $count = 0;
+        my $threshold = 100;
+        #warn "edges for node ", $node->{idx}, ": ", scalar @$edges;
         for my $edge (@$edges) {
             my $ranges = $edge->{char_ranges};
             if (defined $ranges) {
-                for (my $i = 0; $i < @$ranges; $i += 2) {
-                    my ($a, $b) = ($ranges->[0], $ranges->[1]);
-                    $count += $b - $a + 1;
-                    #if ($count > $threshold) {
-                    #last;
-                    #}
+                #warn "check edge ", gen_dfa_edge_label($node, $edge), " w/ ",
+                    #scalar @$ranges, " ranges";
+                #warn "ranges: @$ranges";
+                my $nchars = $edge->{nchars};
+                if ($count + $nchars <= $threshold) {
+                    $count += $nchars;
+                    $edge->{use_case} = 1;
+                    next;
                 }
-                #if ($count <= $threshold) {
-                $edge->{use_case} = 1;
-                next;
-                #}
             }
             last;
         }
-        if ($count >= 5 && $count < 230) {
+        #warn "$count";
+        if ($count >= 2 && $count <= $threshold) {
+            #warn "HIT $count";
             $use_switch = 1;
         }
     }
@@ -2089,4 +2123,16 @@ sub dump_code ($) {
     my $ln = 1;
     (my $str = $code) =~ s/^/sprintf("%3s ", $ln++)/gem;
     return $str;
+}
+
+sub count_chars_in_ranges ($) {
+    my ($ranges) = @_;
+    return 0 unless defined $ranges;
+    my $count = 0;
+    my $n = @$ranges;
+    for (my $i = 0; $i < $n; $i += 2) {
+        my ($a, $b) = ($ranges->[$i], $ranges->[$i + 1]);
+        $count += $b - $a + 1;
+    }
+    return $count;
 }
