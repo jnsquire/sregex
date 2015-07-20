@@ -330,10 +330,10 @@ sub parse_sregex_dfa_res ($$) {
     #warn scalar @lines;
     my $last = pop @lines;
     #warn "last: $last";
-    if ($last =~ /^no match/) {
+    if ($last =~ /\bno match\b/) {
         return 0;
     }
-    if ($last =~ /^matched: (.+)/) {
+    if ($last =~ /\bmatch (\([^:]+)/) {
         my $caps = $1;
         $caps =~ s/( \(-1, -1\))+$//g;
         return $caps;
