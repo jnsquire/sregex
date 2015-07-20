@@ -8,7 +8,7 @@ use warnings;
 use IPC::Run3 qw( run3 );
 use Data::Dumper qw( Dumper );
 use GraphViz ();
-use Time::HiRes qw( time );
+#use Time::HiRes qw( time );
 use List::MoreUtils qw( uniq firstidx );
 use List::Util qw( first max );
 use Carp qw( croak carp );
@@ -1312,7 +1312,7 @@ sub escape_range ($$) {
         my $a = $range->[$i];
         my $b = $range->[$i + 1];
         if (!defined $b) {
-            croak Dumper($range);
+            croak @$range;
         }
         if ($a == $b) {
             $s .= escape_range_char($a);
