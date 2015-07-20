@@ -1689,11 +1689,24 @@ closing_state:
         $src .= "st${idx}_error:\n";
     }
 
-    for (my $i = 0; $i < $nvec; $i++) {
-        $src .= "    ovec[$i] = matched_$i;\n";
+    my $indent = '';
+    if (!$seen_accept) {
+        $src .= "    if (matched_0 != -1) {\n";
+        $indent = '    ';
     }
 
-    $src .= "    return MATCHED;  /* fallback */\n";
+    for (my $i = 0; $i < $nvec; $i++) {
+        $src .= $indent . "    ovec[$i] = matched_$i;\n";
+    }
+
+    $src .= $indent . "    return MATCHED;  /* fallback */\n";
+
+    if (!$seen_accept) {
+        $src .= <<'_EOC_';
+    }
+    return NO_MATCH;
+_EOC_
+    }
 
     return $src;
 }
