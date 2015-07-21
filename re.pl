@@ -546,6 +546,8 @@ sub gen_dfa ($) {
 
     my $nfa_nodes = $nfa->{nodes};
 
+    my %incoming_edges;
+
     my $dfa_node = {
         nfa_nodes => [$nfa_nodes->[0]],
         edges => undef,
@@ -596,17 +598,18 @@ sub gen_dfa ($) {
             $dfa_node->{edges} = $dfa_edges;
         }
 
-        # fix the path mappings in the DFA edges.
-
         #warn "[0] edges for node ", $dfa_node->{idx}, ": ", scalar @$dfa_edges;
         for my $dfa_edge (@$dfa_edges) {
-            #my $ranges = $dfa_edge->{char_ranges};
-            #if (defined $ranges) {
-                #warn "[0] check edge ", gen_dfa_edge_label($dfa_node, $dfa_edge), " w/ ",
-                    #scalar @$ranges, " ranges";
-                #warn "ranges: @$ranges";
-                #canon_range($ranges);
-            #}
+            # compute incoming edges for nodes.
+            my $target = $dfa_edge->{target};
+            my $incoming = $incoming_edges{$target};
+            if (defined $incoming) {
+                push @$incoming, $dfa_edge;
+            } else {
+                $incoming_edges{$target} = [$dfa_edge];
+            }
+
+            # fix the path mappings in the DFA edges
 
             calc_capture_mapping($dfa_node, $dfa_edge);
             my $shadowing = $dfa_edge->{shadowing};
@@ -619,9 +622,43 @@ sub gen_dfa ($) {
         $i++;
     }
 
+    for my $dfa_node (@dfa_nodes) {
+        # compute assertion attributes for each DFA node.
+        my $incoming = $incoming_edges{$dfa_node};
+        my $left_is_word;  # 1 means always word, 0 always nonword, and -1 uncertain
+        for my $dfa_edge (@$incoming) {
+            my $ranges = $dfa_edge->{char_ranges};
+            if (defined $ranges) {
+                for (my $i = 0; $i < @$ranges; $i += 2) {
+                    my ($a, $b) = ($ranges->[$i], $ranges->[$i + 1]);
+                    my $s = join "", chr($a) .. chr($b);
+                    if (!defined $left_is_word || $left_is_word != -1) {
+                        my $s = join "", chr($a) .. chr($b);
+                        if ($s =~ /^\w+$/) {
+                            $left_is_word = !defined $left_is_word || $left_is_word == 1 ? 1 : -1;
+                        } elsif ($s =~ /^\W+$/) {
+                            $left_is_word = !defined $left_is_word || $left_is_word == 0 ? 0 : -1;
+                        } else {
+                            $left_is_word = -1;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (defined $left_is_word) {
+            $dfa_node->{left_is_word} = $left_is_word;
+            if ($left_is_word != -1) {
+                #warn "Found node $dfa_node->{idx} whose left char is always a ",
+                #$left_is_word ? "" : "non", "word";
+            }
+        }
+    }
+
     return {
-        nodes => \@dfa_nodes,
-        nvec => $nfa->{nvec},
+        nodes           => \@dfa_nodes,
+        nvec            => $nfa->{nvec},
+        incoming_edges  => \%incoming_edges,
     };
 }
 
@@ -1415,11 +1452,28 @@ static int match(const u_char *s, size_t len, int *ovec);
 
 
 static inline int
+is_word(int c)
+{
+    /* (isalnum(c) || c == '_'); */
+    switch (c) {
+_EOC_
+
+    for my $c ('0' .. '9', 'A' .. 'Z', 'a' .. 'z', '_') {
+        $src .= "    case '$c':\n";
+    }
+
+    $src .= <<_EOC_;
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+
+static inline int
 is_word_boundary(int a, int b)
 {
-    a = (a != -1 && (isalnum(a) || a == '_'));
-    b = (b != -1 && (isalnum(b) || b == '_'));
-    return (a ^ b);
+    return (is_word(a) ^ is_word(b));
 }
 
 
@@ -1631,7 +1685,7 @@ sub gen_c_from_dfa_node ($$) {
             my $chr = $a_ranges->[0];
 
             $b->{memchr} = 1;
-            my ($b_src) = gen_c_from_dfa_edge($idx, $b, $level, $nvec, undef);
+            my ($b_src) = gen_c_from_dfa_edge($node, $b, $level, $nvec, undef);
             delete $b->{memchr};
 
             $src .= <<_EOC_;
@@ -1657,7 +1711,7 @@ _EOC_
     c = $chr;
 _EOC_
             $a->{default_branch} = 1;
-            my ($a_src) = gen_c_from_dfa_edge($idx, $a, $level, $nvec, undef);
+            my ($a_src) = gen_c_from_dfa_edge($node, $a, $level, $nvec, undef);
             delete $a->{default_branch};
             $src .= $a_src;
 
@@ -1730,7 +1784,7 @@ _EOC_
     my $seen_accept;
     for my $edge (@$edges) {
         my $edge_src;
-        ($edge_src, $to_accept, $use_switch) = gen_c_from_dfa_edge($idx, $edge, $level, $nvec, $use_switch);
+        ($edge_src, $to_accept, $use_switch) = gen_c_from_dfa_edge($node, $edge, $level, $nvec, $use_switch);
 
         $src .= $edge_src;
 
@@ -1788,7 +1842,9 @@ _EOC_
 }
 
 sub gen_c_from_dfa_edge ($$$$$) {
-    my ($from_node_idx, $edge, $level, $nvec, $use_switch) = @_;
+    my ($from_node, $edge, $level, $nvec, $use_switch) = @_;
+
+    my $from_node_idx = $from_node->{idx};
 
     my $src = '';
     my @indents = (" " x (4 * $level), " " x (4 * ($level + 1)));
@@ -1812,9 +1868,22 @@ sub gen_c_from_dfa_edge ($$$$$) {
     }
 
     my @cond;
+    my $right_is_word; # 0 means always not a word, 1 means always a word, and -1 uncertain
     if (defined $ranges && !$edge->{shadowed}) {
         for (my $i = 0; $i < @$ranges; $i += 2) {
             my ($a, $b) = ($ranges->[$i], $ranges->[$i + 1]);
+
+            if (!defined $right_is_word || $right_is_word != -1) {
+                my $s = join "", chr($a) .. chr($b);
+                if ($s =~ /^\w+$/) {
+                    $right_is_word = !defined $right_is_word || $right_is_word == 1 ? 1 : -1;
+                } elsif ($s =~ /^\W+$/) {
+                    $right_is_word = !defined $right_is_word || $right_is_word == 0 ? 0 : -1;
+                } else {
+                    $right_is_word = -1;
+                }
+            }
+
             if ($use_switch) {
                 for my $c ($a .. $b) {
                     push @cond, $c;
@@ -1828,6 +1897,8 @@ sub gen_c_from_dfa_edge ($$$$$) {
             }
         }
     }
+
+    #$right_is_word = -1;
 
     if (@cond) {
         if ($use_switch) {
@@ -1883,7 +1954,7 @@ sub gen_c_from_dfa_edge ($$$$$) {
             if (defined $shadowing) {
                 my $indent = $indents[$indent_idx];
                 $src .= $indent . "if (asserts != 1) { /* shadowed DFA edge */\n";
-                my ($inner, $to_accept) = gen_c_from_dfa_edge($from_node_idx, $shadowing,
+                my ($inner, $to_accept) = gen_c_from_dfa_edge($from_node, $shadowing,
                                                               $level + 2, $nvec, $use_switch);
                 if (defined $inner) {
                     $src .= $inner;
@@ -1893,6 +1964,8 @@ sub gen_c_from_dfa_edge ($$$$$) {
             }
         }
     }
+
+    my $left_is_word = $from_node->{left_is_word};
 
     my $assert_info = $target->{assert_info};
     my $indent = $indents[$indent_idx];
@@ -1907,8 +1980,30 @@ sub gen_c_from_dfa_edge ($$$$$) {
             } elsif ($assert eq '$') {
                 $src .= $indent . 'asserts |= (c == -1 || c == 10) << ' . "$idx;\n";
             } elsif ($assert eq '\b') {
-                $src .= $indent . 'asserts |= is_word_boundary(i >= 2 ? s[i - 2] : -1, c) << '
-                                   . "$idx;\n";
+                #warn "right is word: $right_is_word";
+                if (defined $right_is_word && $right_is_word != -1) {
+                    if ($right_is_word == 1) {  # left char must not be a word
+                        $src .= $indent . 'asserts |= (i >= 2 ? !is_word(s[i - 2]) : 1) << '
+                               . "$idx;\n";
+
+                    } else {  # left char must be a word
+                        $src .= $indent . 'asserts |= (i >= 2 ? is_word(s[i - 2]) : 0) << '
+                               . "$idx;\n";
+                    }
+
+                } else {
+                    if (defined $left_is_word && $left_is_word != -1) {
+                        if ($left_is_word == 1) {  # right char must not be a word
+                            $src .= $indent . 'asserts |= !is_word(c) << ' . "$idx;\n";
+                        } else {  # right char must be a word
+                            $src .= $indent . 'asserts |= is_word(c) << ' . "$idx;\n";
+                        }
+
+                    } else {
+                        $src .= $indent . 'asserts |= is_word_boundary(i >= 2 ? s[i - 2] : -1, c) << '
+                               . "$idx;\n";
+                    }
+                }
             } elsif ($assert eq '\B') {
                 $src .= $indent . 'asserts |= !is_word_boundary(i >= 2 ? s[i - 2] : -1, c) << '
                                    . "$idx;\n";
