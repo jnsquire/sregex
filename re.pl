@@ -219,6 +219,7 @@ if ($big) {
 
 my %nfa_paths;
 my %pc2assert;
+my $used_asserts;
 
 #my $begin = time;
 my $nfa = gen_nfa();
@@ -310,6 +311,7 @@ sub gen_nfa () {
     for my $bc (@bytecodes) {
         my $opcode = opcode($bc);
         if ($opcode eq 'assert') {
+            $used_asserts = 1;
             if (!exists $pc2assert{$idx}) {
                 #warn "new assert $bc->[1]";
                 $pc2assert{$idx} = $bc->[1];
@@ -600,13 +602,15 @@ sub gen_dfa ($) {
 
         #warn "[0] edges for node ", $dfa_node->{idx}, ": ", scalar @$dfa_edges;
         for my $dfa_edge (@$dfa_edges) {
-            # compute incoming edges for nodes.
-            my $target = $dfa_edge->{target};
-            my $incoming = $incoming_edges{$target};
-            if (defined $incoming) {
-                push @$incoming, $dfa_edge;
-            } else {
-                $incoming_edges{$target} = [$dfa_edge];
+            if ($used_asserts) {
+                # compute incoming edges for nodes.
+                my $target = $dfa_edge->{target};
+                my $incoming = $incoming_edges{$target};
+                if (defined $incoming) {
+                    push @$incoming, $dfa_edge;
+                } else {
+                    $incoming_edges{$target} = [$dfa_edge];
+                }
             }
 
             # fix the path mappings in the DFA edges
@@ -1988,6 +1992,7 @@ sub gen_c_from_dfa_edge ($$$$$) {
 
                     if ($right_is_word == 1) {  # left char must not be a word
                         if (defined $left_is_word && $left_is_word != -1) {
+                            #warn "HIT";
                             if ($left_is_word == 0) {
                                 $src .= "asserts |= " . (1 << $idx) . ";\n";
                             } else {
