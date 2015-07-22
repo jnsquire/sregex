@@ -1606,7 +1606,7 @@ main(void)
     }
 
     if (best != -1) {
-        printf(": %.02lf ms elapsed (%d matches found, $repeat repeated times).\\n",
+        printf(": %.05lf ms elapsed (%d matches found, $repeat repeated times).\\n",
                best * 1e3, matches);
 
     } else {
