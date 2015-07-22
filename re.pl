@@ -633,14 +633,15 @@ sub gen_dfa ($) {
         # compute assertion attributes for each DFA node.
         my $incoming = $incoming_edges{$dfa_node};
         my $left_is_word;  # 1 means always word, 0 always nonword, and -1 uncertain
+        my $left_is_ln_start; # ditto
         for my $dfa_edge (@$incoming) {
             my $ranges = $dfa_edge->{char_ranges};
             if (defined $ranges) {
                 for (my $i = 0; $i < @$ranges; $i += 2) {
                     my ($a, $b) = ($ranges->[$i], $ranges->[$i + 1]);
-                    my $s = join "", chr($a) .. chr($b);
+                    my $s;
                     if (!defined $left_is_word || $left_is_word != -1) {
-                        my $s = join "", chr($a) .. chr($b);
+                        $s = join "", map { chr } $a .. $b;
                         if ($s =~ /^\w+$/) {
                             $left_is_word = !defined $left_is_word || $left_is_word == 1 ? 1 : -1;
                         } elsif ($s =~ /^\W+$/) {
@@ -649,16 +650,36 @@ sub gen_dfa ($) {
                             $left_is_word = -1;
                         }
                     }
+                    if (!defined $left_is_ln_start || $left_is_ln_start != -1) {
+                        $s //= join "", map { chr } $a .. $b;
+                        if ($s =~ /^\n+$/s) {
+                            #warn "HIT";
+                            $left_is_ln_start = !defined $left_is_ln_start || $left_is_ln_start == 1 ? 1 : -1;
+                        } elsif ($s !~ /\n/s) {
+                            #warn "HIT \\N+: ", Dumper($s);
+                            $left_is_ln_start = !defined $left_is_ln_start || $left_is_ln_start == 0 ? 0 : -1;
+                        } else {
+                            $left_is_ln_start = -1;
+                        }
+                    }
                 }
             }
         }
 
         if (defined $left_is_word) {
             $dfa_node->{left_is_word} = $left_is_word;
-            if ($left_is_word != -1) {
+            #if ($left_is_word != -1) {
                 #warn "Found node $dfa_node->{idx} whose left char is always a ",
                 #$left_is_word ? "" : "non", "word";
-            }
+            #}
+        }
+
+        if (defined $left_is_ln_start) {
+            $dfa_node->{left_is_ln_start} = $left_is_ln_start;
+            #if ($left_is_ln_start != -1) {
+                #warn "Found node $dfa_node->{idx} whose left char is always a ",
+                #$left_is_ln_start ?  "" : "non", "line start";
+            #}
         }
     }
 
@@ -1976,6 +1997,9 @@ sub gen_c_from_dfa_edge ($$$$$) {
     }
 
     my $left_is_word = $from_node->{left_is_word};
+    my $left_is_ln_start = $from_node->{left_is_ln_start};
+
+    #warn "left is ln start: ", $left_is_ln_start;
 
     my $assert_info = $target->{assert_info};
     my $indent = $indents[$indent_idx];
@@ -1986,7 +2010,22 @@ sub gen_c_from_dfa_edge ($$$$$) {
         for my $assert (sort keys %$asserts) {
             my $idx = $asserts->{$assert};
             if ($assert eq '^') {
-                if ($min_len >= 1) {
+                #warn "found ^: $from_node->{start}: [$left_is_ln_start]";
+                if ($from_node->{start}) {
+                    #warn "HIT start";
+                    $src .= $indent . "asserts |= 1 << $idx;\n";
+                } elsif (defined $left_is_ln_start && $left_is_ln_start != -1) {
+                    #warn "HIT left is ln start: $left_is_ln_start ",
+                    #gen_dfa_node_label($from_node), " => ",
+                    #gen_dfa_node_label($edge->{target});
+
+                    if ($left_is_ln_start == 1) {
+                        $src .= $indent . 'asserts |= (1 << ' . "$idx);\n";
+                    } else {
+                        # do nothing, since the result is always 0.
+                    }
+
+                } elsif ($min_len >= 1) {
                     $src .= $indent . 'asserts |= (s[i - 2] == 10) << ' . "$idx;\n";
                 } else {
                     $src .= $indent . 'asserts |= (i == 1 || (i >= 2 && s[i - 2] == 10)) << '
