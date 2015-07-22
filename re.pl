@@ -2,6 +2,7 @@
 
 # Copyright (C) 2015 Yichun Zhang (agentzh)
 
+use 5.010001;
 use strict;
 use warnings;
 
@@ -48,6 +49,7 @@ sub gen_c_from_dfa_edge ($$$$$);
 sub gen_c_from_dfa_node ($$);
 sub dump_code ($);
 sub count_chars_in_ranges ($);
+sub analyze_dfa ($);
 
 my $cc = "cc";
 my $debug = 0;
@@ -232,6 +234,7 @@ draw_nfa($nfa) if $debug;
 my $dfa = gen_dfa($nfa);
 #$elapsed = time - $begin;
 #warn "DFA generated ($elapsed sec).\n";
+analyze_dfa($dfa);
 
 #warn Dumper($dfa);
 draw_dfa($dfa) if $debug;
@@ -1369,11 +1372,14 @@ sub gen_dfa_edge_label ($$) {
 
 sub gen_dfa_node_label ($) {
     my ($node) = @_;
-    if ($node->{start}) {
-        return "0";
-    }
-    my @lines = (join ",", @{ $node->{states} });
+    #if ($node->{start}) {
+    #return "0";
+    #}
+    my @lines = "{" . join(",", @{ $node->{states} }) . "}";
     push @lines, "[" . $node->{idx} . "]";
+    if (defined $node->{min_len}) {
+        push @lines, "∧=$node->{min_len}";
+    }
     return join "\\n", @lines;
 }
 
@@ -1976,11 +1982,16 @@ sub gen_c_from_dfa_edge ($$$$$) {
     if (defined $assert_info) {
         my $asserts = $assert_info->{asserts};
         $src .= $indent . "int asserts = 0;\n";
+        my $min_len = $from_node->{min_len} // die;
         for my $assert (sort keys %$asserts) {
             my $idx = $asserts->{$assert};
             if ($assert eq '^') {
-                $src .= $indent . 'asserts |= (i == 1 || (i >= 2 && s[i - 2] == 10)) << '
-                                   . "$idx;\n";
+                if ($min_len >= 1) {
+                    $src .= $indent . 'asserts |= (s[i - 2] == 10) << ' . "$idx;\n";
+                } else {
+                    $src .= $indent . 'asserts |= (i == 1 || (i >= 2 && s[i - 2] == 10)) << '
+                           . "$idx;\n";
+                }
             } elsif ($assert eq '$') {
                 $src .= $indent . 'asserts |= (c == -1 || c == 10) << ' . "$idx;\n";
             } elsif ($assert eq '\b') {
@@ -2000,8 +2011,12 @@ sub gen_c_from_dfa_edge ($$$$$) {
                             }
 
                         } else {
-                            $src .= $indent . 'asserts |= (i >= 2 ? !is_word(s[i - 2]) : 1) << '
-                                   . "$idx;\n";
+                            if ($min_len >= 1) {
+                                $src .= $indent . 'asserts |= !is_word(s[i - 2]) << ' . "$idx;\n";
+                            } else {
+                                $src .= $indent . 'asserts |= (i >= 2 ? !is_word(s[i - 2]) : 1) << '
+                                       . "$idx;\n";
+                            }
                         }
 
                     } else {  # left char must be a word
@@ -2013,8 +2028,13 @@ sub gen_c_from_dfa_edge ($$$$$) {
                             }
 
                         } else {
-                            $src .= $indent . 'asserts |= (i >= 2 ? is_word(s[i - 2]) : 0) << '
-                                   . "$idx;\n";
+                            if ($min_len >= 1) {
+                                $src .= $indent . 'asserts |= is_word(s[i - 2]) << '
+                                       . "$idx;\n";
+                            } else {
+                                $src .= $indent . 'asserts |= (i >= 2 ? is_word(s[i - 2]) : 0) << '
+                                       . "$idx;\n";
+                            }
                         }
                     }
 
@@ -2027,13 +2047,23 @@ sub gen_c_from_dfa_edge ($$$$$) {
                         }
 
                     } else {
-                        $src .= $indent . 'asserts |= is_word_boundary(i >= 2 ? s[i - 2] : -1, c) << '
-                               . "$idx;\n";
+                        if ($min_len >= 1) {
+                            $src .= $indent . 'asserts |= is_word_boundary(s[i - 2], c) << '
+                                   . "$idx;\n";
+                        } else {
+                            $src .= $indent . 'asserts |= is_word_boundary(i >= 2 ? s[i - 2] : -1, c) << '
+                                   . "$idx;\n";
+                        }
                     }
                 }
             } elsif ($assert eq '\B') {
-                $src .= $indent . 'asserts |= !is_word_boundary(i >= 2 ? s[i - 2] : -1, c) << '
-                                   . "$idx;\n";
+                if ($min_len >= 1) {
+                    $src .= $indent . 'asserts |= !is_word_boundary(s[i - 2], c) << '
+                           . "$idx;\n";
+                } else {
+                    $src .= $indent . 'asserts |= !is_word_boundary(i >= 2 ? s[i - 2] : -1, c) << '
+                           . "$idx;\n";
+                }
             } elsif ($assert eq '\A') {
                 $src .= $indent . 'asserts |= (i == 1) << '
                                    . "$idx;\n";
@@ -2264,4 +2294,99 @@ sub count_chars_in_ranges ($) {
         $count += $b - $a + 1;
     }
     return $count;
+}
+
+sub analyze_dfa ($) {
+    my ($dfa) = @_;
+
+    my $dfa_nodes = $dfa->{nodes};
+
+    # compute min/max length of input string consumed for each DFA node.
+    for my $node (@$dfa_nodes) {
+        if ($node->{start}) {
+            $node->{min_len} = 0;
+        }
+        #$node->{max_len} = 0;
+    }
+
+    my $changes;
+    do {{
+        $changes = 0;
+        for my $node (@$dfa_nodes) {
+            #warn "=== checking node $node->{idx}";
+            my $min = $node->{min_len};
+            #my $max = $node->{max_len};
+            my $edges = $node->{edges};
+            my @all_edges = @$edges;
+            for (my $i = 0; $i < @all_edges; $i++) {
+                my $edge = $all_edges[$i];
+                my $target = $edge->{target};
+                if (defined $edge->{shadowing}) {
+                    push @all_edges, $edge->{shadowing};
+                }
+                #warn "--- checking target $target->{idx}";
+                my $min2 = $target->{min_len};
+                #my $max2 = $target->{max_len};
+                my $delta;
+                if (defined $edge->{char_ranges}) {
+                    # must consume a char
+                    $delta = 1;
+                } else {
+                    $delta = 0;
+                }
+
+                if (defined $min) {
+                    if (!defined $min2 || $min + $delta < $min2) {
+                        $target->{min_len} = $min + $delta;
+                        #warn "set node $target->{idx}'s min_len to ", $target->{min_len};
+                        $changes++;
+                    } else {
+                        #warn "nothing to be done for node $target->{idx}";
+                    }
+                } else {
+                    #warn "nothing to be done for node $target->{idx}";
+                }
+
+=begin comment
+
+                if ($target eq $node || !defined $max) {
+                    if (defined $max2) {
+                        #warn "set node $target->{idx}'s max_len to Inf";
+                        undef $target->{max_len};
+                        $changes++;
+                    } else {
+                        #warn "nothing to be done for node $target->{idx}";
+                    }
+
+                } else {
+                    if (defined $max2 && $max + $delta > $max2) {
+                        $target->{max_len} = $max + $delta;
+                        #warn "set node $target->{idx}'s max_len to ", $target->{max_len};
+                        $changes++;
+                    } else {
+                        #warn "nothing to be done for node $target->{idx}";
+                    }
+                }
+
+=end comment
+
+=cut
+            }  # for
+        }  # for
+        #warn "iteration done: $changes";
+    }} while ($changes > 0);
+
+    $changes = 0;
+    for my $node (@$dfa_nodes) {
+        if (!defined $node->{min_len}) {
+            # remove unreachable nodes
+            $changes++;
+            undef $node;
+        }
+    }
+
+    if ($changes > 0) {
+        #warn "removed $changes unreacheable nodes.\n";
+        @$dfa_nodes = grep { defined } @$dfa_nodes;
+    }
 }
