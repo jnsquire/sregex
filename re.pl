@@ -716,6 +716,7 @@ sub gen_dfa_edges_for_asserts ($$$$$$) {
             # not possible
             next;
         }
+        $from_node->{max_assert_settings} = $max_encoding;
         my $dfa_edge = {
             assert_settings => $comb_encoding,
             nfa_edges => reorder_nfa_edges(\@filtered_nfa_edges, undef),
@@ -1792,7 +1793,7 @@ _EOC_
             $seen_accept = 1;
         }
 
-        if ($to_accept) {
+        if ($to_accept && @$edges > 1) {
             $src .= "    if (c != -1) {\n";
             if ($use_switch) {
                 $src .= "        switch (c) {\n";
@@ -1805,10 +1806,9 @@ _EOC_
         $src .= "    default:\n        break;\n    }\n";
     }
 
-    if ($seen_accept) {
+    if ($seen_accept && @$edges > 1) {
         $src .= "    }\n";
         $level--;
-
     }
 
 closing_state:
@@ -2023,12 +2023,19 @@ sub gen_c_from_dfa_edge ($$$$$) {
 
         #warn "assert edges: $assert_edges\n";
 
+        #warn "$edge: ", $target->{max_assert_settings}, " vs ", scalar @$assert_edges;
+        my $use_default = (@$assert_edges == $target->{max_assert_settings} + 1);
         for my $subedge (@$assert_edges) {
             my $assert_settings = $subedge->{assert_settings};
             #die unless ref $assert_settings;
             my $target = $subedge->{target};
-            $src .= $indent . "if (asserts == $assert_settings) {\n";
-            my $indent2 = $indent . (" " x 4);
+            my $indent2;
+            if ($use_default && $subedge eq $assert_edges->[-1]) {
+                $src .= $indent . "{ /* asserts == $assert_settings */\n";
+            } else {
+                $src .= $indent . "if (asserts == $assert_settings) {\n";
+            }
+            $indent2 = $indent . (" " x 4);
             if ($target->{accept}) {
                 $to_accept = 1;
             }
