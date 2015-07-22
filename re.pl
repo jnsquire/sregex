@@ -1982,13 +1982,35 @@ sub gen_c_from_dfa_edge ($$$$$) {
             } elsif ($assert eq '\b') {
                 #warn "right is word: $right_is_word";
                 if (defined $right_is_word && $right_is_word != -1) {
+                    #if (defined $left_is_word && $left_is_word != -1) {
+                        #warn "HIT! $left_is_word vs $right_is_word";
+                    #}
+
                     if ($right_is_word == 1) {  # left char must not be a word
-                        $src .= $indent . 'asserts |= (i >= 2 ? !is_word(s[i - 2]) : 1) << '
-                               . "$idx;\n";
+                        if (defined $left_is_word && $left_is_word != -1) {
+                            if ($left_is_word == 0) {
+                                $src .= "asserts |= " . (1 << $idx) . ";\n";
+                            } else {
+                                # do nothing, since it's "asserts |= 0;".
+                            }
+
+                        } else {
+                            $src .= $indent . 'asserts |= (i >= 2 ? !is_word(s[i - 2]) : 1) << '
+                                   . "$idx;\n";
+                        }
 
                     } else {  # left char must be a word
-                        $src .= $indent . 'asserts |= (i >= 2 ? is_word(s[i - 2]) : 0) << '
-                               . "$idx;\n";
+                        if (defined $left_is_word && $left_is_word != -1) {
+                            if ($left_is_word == 1) {
+                                $src .= "asserts |= " . (1 << $idx) . ";\n";
+                            } else {
+                                # do nothing, since it's "asserts |= 0;".
+                            }
+
+                        } else {
+                            $src .= $indent . 'asserts |= (i >= 2 ? is_word(s[i - 2]) : 0) << '
+                                   . "$idx;\n";
+                        }
                     }
 
                 } else {
