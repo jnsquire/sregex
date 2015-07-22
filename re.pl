@@ -1449,7 +1449,7 @@ enum {
 };
 
 
-static int match(const u_char *s, size_t len, int *ovec);
+static int match(const u_char *const s, size_t len, int *const ovec);
 
 
 static inline int
@@ -1608,7 +1608,7 @@ main(void)
 
 
 static int
-match(const u_char *s, size_t len, int *ovec)
+match(const u_char *const s, size_t len, int *const ovec)
 {
     int c;
     int i = 0;
