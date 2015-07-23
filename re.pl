@@ -1760,6 +1760,8 @@ _EOC_
 
     if (@$edges >= 2) {
         # try to apply the bit-map multi-char search optimization
+        # TODO: we need better heuristics to choose between branch tables and
+        # bitmaps.
         my $last = $edges->[-1];
         if (!defined $last->{assert_info}
             && $last->{default_branch}
