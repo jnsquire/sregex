@@ -68,14 +68,11 @@ if ($help) {
     usage(0);
 }
 
-if (!$timer) {
-    if (defined $repeat) {
-        warn "WARNING: --repeat is ignored because --timer is not specified.\n";
-    }
-    $repeat = 1;
+if (!defined $timer) {
     $timer = 0;
+}
 
-} elsif (!$repeat) {
+if (!$repeat) {
     $repeat = 5;
 }
 
@@ -244,18 +241,21 @@ my $c = gen_c_from_dfa($dfa);
 warn dump_code($c) if $debug == 2;
 #$begin = time;
 {
-    my ($fh, $fname) = tempfile(SUFFIX => '.c', UNLINK => 1);
-    #warn $fname;
-    print $fh $c;
-    close $fh;
-
+    my ($fh, $fname);
     my $exe_tmp;
     if (!defined $exefile) {
+        ($fh, $fname) = tempfile(SUFFIX => '.c', UNLINK => 1);
         $exefile = tmpnam();
         $exe_tmp = 1;
     } else {
         unlink $exefile if -f $exefile;
+        $fname = $exefile . ".c";
+        open $fh, ">$fname" or die "cannot open $fname for writing: $!\n";
     }
+
+    #warn $fname;
+    print $fh $c;
+    close $fh;
 
     #system("cc -o $exefile -Wall -Wno-unused-label -Wno-unused-variable -Wno-unused-but-set-variable -Werror -O0 $fname") == 0
     my $extra_ccopt = "";
@@ -1573,7 +1573,11 @@ main(void)
     /* memset(ovec, -1, sizeof(ovec)/sizeof(ovec[0])); */
 
     {
-        size_t      rest;
+        /* the "volatile" keyword is just to avoid the C compiler from
+         * optimizing our useless loop away.
+         */
+        size_t          rest;
+        volatile int    i;
 
         for (i = 0; i < $repeat; i++) {
             double               elapsed, begin, end;
@@ -1710,6 +1714,7 @@ sub gen_c_from_dfa_node ($$) {
             && @$a_ranges == 2
             && $a_ranges->[0] == $a_ranges->[1]
             && !defined $a->{target}{assert_info}
+            && !$b->{target}{assert_info}
             && $b->{default_branch}
             && $b->{target} eq $node)
         {
@@ -1751,6 +1756,113 @@ _EOC_
         }
     }
 
+    my $gen_read_char = 1;
+
+    if (@$edges >= 2) {
+        # try to apply the bit-map multi-char search optimization
+        my $last = $edges->[-1];
+        if (!defined $last->{assert_info}
+            && $last->{default_branch}
+            && $last->{target} eq $node)
+        {
+            my $max_nchars = 100;
+            my $min_nchars = 3;
+            my $ok = 1;
+            my $total = 0;
+            for (my $i = 0; $i < @$edges - 1; $i++) {
+                my $e = $edges->[$i];
+                if ($e->{to_accept} || defined $e->{target}{assert_info}) {
+                    undef $ok;
+                    last;
+                }
+                my $nchars = $e->{nchars};
+                if ($total + $nchars > $max_nchars) {
+                    undef $ok;
+                    last;
+                }
+                $total += $nchars;
+            }
+
+            if ($total < $min_nchars) {
+                undef $ok;
+            }
+
+            #undef $ok;
+
+            if ($ok) {
+                #warn "HIT bit-map: $re: $idx: ", gen_dfa_node_label($node);
+
+                # generate the start byte bitmap
+                my @bitmap;  # with 256 bits, 32 bytes.
+                for (my $i = 0; $i < @$edges - 1; $i++) {
+                    my $e = $edges->[$i];
+                    my $ranges = $e->{char_ranges};
+                    for (my $i = 0; $i < @$ranges; $i += 2) {
+                        my ($a, $b) = ($ranges->[$i], $ranges->[$i + 1]);
+                        for (my $c = $a; $c <= $b; $c++) {
+                            my $idx = $c >> 3;
+                            my $byte = $bitmap[$idx];
+                            if (!defined $byte) {
+                                $byte = 0;
+                            }
+                            $byte |= (1 << ($c & 7));
+                            $bitmap[$idx] = $byte;
+                        }
+                    }
+                }
+
+                $last->{memchr} = 1;
+                my ($last_handler_src) =
+                    gen_c_from_dfa_edge($node, $last, $level, $nvec, undef);
+                delete $last->{memchr};
+
+                $src .= <<_EOC_;
+    {
+        /* shortcut: search for multiple chars with a bitmap. */
+
+        static const u_char bitmap_$idx\[32] = {
+_EOC_
+
+                my $indent = " " x (4 * 3);
+                for (my $i = 0; $i < 32; $i += 4) {
+                    my ($a, $b, $c, $d) = ($bitmap[$i], $bitmap[$i + 1], $bitmap[$i + 2], $bitmap[$i + 3]);
+                    $a //= 0;
+                    $b //= 0;
+                    $c //= 0;
+                    $d //= 0;
+                    $src .= $indent . "$a, $b, $c, $d";
+                    if ($i + 4 != 32) {
+                        $src .= ",\n";
+                    } else {
+                        $src .= "\n" . (" " x (4 * 2)) . "};\n\n";
+                    }
+                }
+
+                # TODO: use assembly to do faster dword/qword scanning.
+                $src .= <<_EOC_;
+        for (; i < len; i++) {
+            c = s[i];
+            if ((bitmap_$idx\[c >> 3] & (1 << (c & 7))) != 0) {
+                break;
+            }
+        }
+
+        if (unlikely(i == len)) {
+            goto st${idx}_error;
+        }
+    }
+
+$last_handler_src
+    i++;
+_EOC_
+                $used_error = 1;
+                $edges->[-2]{default_branch} = 1;
+                pop @$edges;  # FIXME: do not taint DFA
+                undef $gen_read_char;
+            }
+        }
+    }
+
     my $use_switch;
     if (@$edges >= 2) {
         # try to apply switch/case optimization
@@ -1783,7 +1895,7 @@ _EOC_
 
     my $to_accept;
 
-    if (@$edges) {
+    if ($gen_read_char && @$edges) {
         if ($edges->[0]{to_accept}) {
             $src .= "    c = i < len ? s[i++] : (i++, -1);\n";
             if ($debug) {
@@ -2298,8 +2410,9 @@ Options:
     --out=FILE      specify the output executable file generated by the
                     C compiler.
 
-    --repeat=N      repeat the operations for N times (default to 3) and pick
-                    the best result. only effective when --timer is specified.
+    --repeat=N      repeat the operations for N times (default to 3) and also
+                    pick the best timing result if the --timer option is
+                    specified.
 
     --timer         insert timer code for the match routine in the compiled
                     program.
