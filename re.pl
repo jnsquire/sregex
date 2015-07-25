@@ -48,7 +48,7 @@ sub gen_capture_handler_c_code ($$$$);
 sub gen_c_from_dfa_edge ($$$$$);
 sub gen_c_from_dfa_node ($$);
 sub dump_code ($);
-sub count_chars_in_ranges ($);
+sub count_chars_and_holes_in_ranges ($);
 sub analyze_dfa ($);
 
 my $cc = "cc";
@@ -965,8 +965,10 @@ sub gen_dfa_edges ($$$$$$) {
 
     #warn "count chars in edges";
     for my $dfa_edge (@dfa_edges) {
-        $dfa_edge->{nchars} = count_chars_in_ranges($dfa_edge->{char_ranges});
-        #warn "nchars: ", $dfa_edge->{nchars};
+        my ($nchars, $nholes) = count_chars_and_holes_in_ranges($dfa_edge->{char_ranges});
+        $dfa_edge->{nchars} = $nchars;
+        $dfa_edge->{nholes} = $nholes;
+        #warn "nchars: ", $nchars, ", nholes: $nholes";
     }
 
     @dfa_edges = sort { $a->{nchars} <=> $b->{nchars} } @dfa_edges;
@@ -1769,8 +1771,10 @@ _EOC_
         {
             my $max_nchars = 100;
             my $min_nchars = 3;
+            my $max_holes_ratio = 0.3;
             my $ok = 1;
-            my $total = 0;
+            my $total_holes = 0;
+            my $total_chars = 0;
             for (my $i = 0; $i < @$edges - 1; $i++) {
                 my $e = $edges->[$i];
                 if ($e->{to_accept} || defined $e->{target}{assert_info}) {
@@ -1778,18 +1782,23 @@ _EOC_
                     last;
                 }
                 my $nchars = $e->{nchars};
-                if ($total + $nchars > $max_nchars) {
+                if ($total_chars + $nchars > $max_nchars) {
                     undef $ok;
                     last;
                 }
-                $total += $nchars;
+                $total_chars += $nchars;
+                $total_holes += $e->{nholes};
             }
 
-            if ($total < $min_nchars) {
-                undef $ok;
+            if ($ok) {
+                if ($total_chars < $min_nchars) {
+                    undef $ok;
+                } elsif ($total_chars >= 5 && $total_holes / $total_chars <= $max_holes_ratio) {
+                    #warn "DFA node $node->{idx}: small holes ratio: ",
+                        #$total_holes / $total_chars, ", falling back to jump table";
+                    undef $ok;
+                }
             }
-
-            #undef $ok;
 
             if ($ok) {
                 #warn "HIT bit-map: $re: $idx: ", gen_dfa_node_label($node);
@@ -2438,16 +2447,22 @@ sub dump_code ($) {
     return $str;
 }
 
-sub count_chars_in_ranges ($) {
+sub count_chars_and_holes_in_ranges ($) {
     my ($ranges) = @_;
-    return 0 unless defined $ranges;
+    return (0, 0) unless defined $ranges;
     my $count = 0;
+    my $holes = 0;
+    my $prev_b;
     my $n = @$ranges;
     for (my $i = 0; $i < $n; $i += 2) {
         my ($a, $b) = ($ranges->[$i], $ranges->[$i + 1]);
         $count += $b - $a + 1;
+        if (defined $prev_b) {
+            $holes += $a - $prev_b - 1;
+        }
+        $prev_b = $b;
     }
-    return $count;
+    return ($count, $holes);
 }
 
 sub analyze_dfa ($) {
