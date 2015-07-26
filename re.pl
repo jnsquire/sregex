@@ -12,8 +12,8 @@
 #
 # Usge examples:
 #
-#   $ ./re.pl 'ab|a' 'cab'
-#   SRegex DFA proto match (1, 3)
+#   $ ./re.pl 'a(b)|a' 'caba'
+#   SRegex DFA proto match (1, 3) (2, 3)
 #
 #   # the following command generates some debug outputs
 #   # as well as PNG images ./nfa.png and ./dfa.png,
