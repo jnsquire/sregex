@@ -1,6 +1,41 @@
 #!/usr/bin/env perl
 
-# Copyright (C) 2015 Yichun Zhang (agentzh)
+# This is a quick prototype in Perl for the new DFA backend
+# for the sregex engine. This prototype serves to verify the
+# algorithms and estimate the ultimate performance.
+#
+# This prototype is currently a compiler that compiles reges
+# patterns down to standalone pure C programs that can do
+# the matching on input data files. So this prototype invokes
+# external C compiler toolchain (like gcc/clang/tcc) to
+# compile the resulting C programs.
+#
+# Usge examples:
+#
+#   $ ./re.pl 'ab|a' 'cab'
+#   SRegex DFA proto match (1, 3)
+#
+# Under the hood, this program uses my own DFA-based algorithm
+# that supports general sub-match capturing as well as
+# all other goodies sregex already supports, including 0-width
+# assertions. The essential idea is "determinizing" Thompson's
+# NFA simulation algorithms with the Rob Pike extension that
+# adds sub-match capturing support.
+#
+# Currently all the regex syntax supported by the mainline
+# sregex is supported by this prototype. The whole existing
+# sregex test suite is passed completely by this toy.
+#
+# Eventually this toy will be ported over to pure C and a
+# Just-In-Compiler will be added so as to get rid of
+# the external C compiler toolchain if we wish. We may still
+# keep # a static C code emitter in the final pure C
+# implementation of this prototype though.
+#
+# Copyright (C) 2015 Yichun Zhang (agentzh).
+#
+# This program can be redistributed under the same terms as
+# the sregex library itself.
 
 use 5.010001;
 use strict;
