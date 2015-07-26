@@ -15,6 +15,14 @@
 #   $ ./re.pl 'ab|a' 'cab'
 #   SRegex DFA proto match (1, 3)
 #
+#   # the following command generates some debug outputs
+#   # as well as PNG images ./nfa.png and ./dfa.png,
+#   # for the NFA and DFA graphs, respectively.
+#   $ ./re.pl --debug=1 'ab|a' 'cab'
+#
+#   # even more verbose outputs.
+#   $ ./re.pl --debug=2 'a+' 'a'
+#
 # Under the hood, this program uses my own DFA-based algorithm
 # that supports general sub-match capturing as well as
 # all other goodies sregex already supports, including 0-width
