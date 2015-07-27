@@ -15,6 +15,10 @@
 #   $ ./re.pl 'a(b)|a' 'caba'
 #   SRegex DFA proto match (1, 3) (2, 3)
 #
+#   # generate a standalone binary program "foo" and its
+#   # corresponding C source file "foo.c":
+#   $ ./re.pl -o foo 'a|b' 'a'
+#
 #   # the following command generates some debug outputs
 #   # as well as PNG images ./nfa.png and ./dfa.png,
 #   # for the NFA and DFA graphs, respectively.
