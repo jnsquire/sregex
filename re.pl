@@ -209,7 +209,6 @@ close $in;
 
 #warn Dumper \@bytecodes;
 
-my $big;
 my %cached_labels;
 my %escaped_range_chars = (
     "\t" => '\t',
@@ -251,17 +250,11 @@ my $node_attr =
     style => 'filled',
     fillcolor => 'yellow',
 };
-$node_attr->{height} = 0.1 if $big;
 
 my $edge_attr =
 {
     color => 'red',
 };
-if ($big) {
-    $edge_attr->{arrowsize} = 0.5;
-} else {
-    #$edge_attr->{len} = 1.4;
-}
 
 my %nfa_paths;
 my %pc2assert;
@@ -415,14 +408,24 @@ sub gen_nfa () {
 sub draw_nfa ($) {
     my ($nfa) = @_;
 
+    my $nfa_nodes = $nfa->{nodes};
+
+    my $big;
+    if (@$nfa_nodes >= 20) {
+        $node_attr->{height} = 0.1;
+        $edge_attr->{arrowsize} = 0.5;
+        $big = 1;
+    } else {
+        undef $node_attr->{height};
+        undef $edge_attr->{arrowsize};
+    }
+
     my $graph = GraphViz->new(
         layout => $big ? 'twopi' : 'neato',
         ratio => 'auto',
         node => $node_attr,
         edge => $edge_attr,
     );
-
-    my $nfa_nodes = $nfa->{nodes};
 
     #$graph->as_dot("nfa.dot");
     for my $node (@$nfa_nodes) {
@@ -1371,14 +1374,24 @@ sub add_to_hash ($$) {
 sub draw_dfa ($) {
     my ($dfa) = @_;
 
+    my $dfa_nodes = $dfa->{nodes};
+
+    my $big;
+    if (@$dfa_nodes >= 20) {
+        $node_attr->{height} = 0.1;
+        $edge_attr->{arrowsize} = 0.5;
+        $big = 1;
+    } else {
+        undef $node_attr->{height};
+        undef $edge_attr->{arrowsize};
+    }
+
     my $graph = GraphViz->new(
         layout => $big ? 'twopi' : 'neato',
         ratio => 'auto',
         node => $node_attr,
         edge => $edge_attr,
     );
-
-    my $dfa_nodes = $dfa->{nodes};
 
     for my $node (@$dfa_nodes) {
         my $idx = $node->{idx};
