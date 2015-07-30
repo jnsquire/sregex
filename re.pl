@@ -382,8 +382,14 @@ sub gen_nfa () {
         if ($opcode eq 'assert') {
             $used_asserts = 1;
             if (!exists $pc2assert{$idx}) {
-                #warn "new assert $bc->[1]";
-                $pc2assert{$idx} = $bc->[1];
+                my $assert = $bc->[1];
+                if ($assert eq 'cnt') {
+                    my @v = @$bc;
+                    shift @v;
+                    $assert = join " ", @v;
+                }
+                $pc2assert{$idx} = $assert;
+                #warn "new assert $assert";
                 $found = 1;
             }
         } elsif ($opcode eq 'save') {
@@ -504,7 +510,7 @@ sub add_nfa_edges ($$$$) {
         if ($opcode eq 'nop') {
             return;
         }
-        warn "skipped NOP and reached bytecode $idx: $opcode";
+        #warn "skipped NOP and reached bytecode $idx: $opcode";
     }
 
     if (exists $visited->{$idx}) {
@@ -715,6 +721,8 @@ sub gen_dfa ($) {
         my $nfa_nodes = $dfa_node->{nfa_nodes};
         my $dfa_edges;
 
+        #warn "processing node $dfa_node->{idx}";
+
         if (!defined $nfa_nodes) {
             # must be of the special assert node type
             my $assert_info = $dfa_node->{assert_info};
@@ -751,8 +759,8 @@ sub gen_dfa ($) {
         #warn "[0] edges for node ", $dfa_node->{idx}, ": ", scalar @$dfa_edges;
         for my $dfa_edge (@$dfa_edges) {
             if ($used_asserts) {
-                # compute incoming edges for nodes.
                 my $target = $dfa_edge->{target};
+                #warn("compute incoming edges for node $target->{idx} (from $dfa_node->{idx})");
                 my $incoming = $incoming_edges{$target};
                 if (defined $incoming) {
                     push @$incoming, $dfa_edge;
@@ -864,10 +872,15 @@ sub gen_dfa_edges_for_asserts ($$$$$$) {
     my $assert_nfa_edges = $assert_info->{assert_nfa_edges};
     my $uniq_assert_cnt = $assert_info->{uniq_assert_cnt};
     my $asserts = $assert_info->{asserts};
+    my $bad_assert_settings = $assert_info->{bad_assert_settings};
     # split the DFA edge according to assertions' on/off combinations
     my @dfa_edges;
     my $max_encoding = 2 ** $uniq_assert_cnt - 1;
     for (my $comb_encoding = 0; $comb_encoding <= $max_encoding; $comb_encoding++) {
+        if ($bad_assert_settings->{$comb_encoding}) {
+            #warn "HIT $comb_encoding ($from_node->{idx})";
+            next;
+        }
         my @filtered_nfa_edges;
         my $row = 0;
         for my $e (@$nfa_edges) {
@@ -886,7 +899,7 @@ sub gen_dfa_edges_for_asserts ($$$$$$) {
             }
         }
         if (!@filtered_nfa_edges) {
-            # not possible
+            #warn("not possible $comb_encoding ($from_node->{idx})");
             next;
         }
         $from_node->{max_assert_settings} = $max_encoding;
@@ -926,6 +939,7 @@ sub gen_dfa_edges ($$$$$$) {
         $prio{$nfa_edge} = $prio++;
 
         if ($in_shadow) {
+            #warn "in shadow: @$nfa_edge";
             $shadowed_nfa_edges{$nfa_edge} = 1;
         }
 
@@ -1160,9 +1174,24 @@ sub resolve_dfa_edge ($$$$$$$$) {
         $dfa_edge->{nfa_edges} = $nfa_edges;
     }
 
-    my @states;
+    my (@states, @actions);
     for my $nfa_edge (@$nfa_edges) {
-        push @states, $nfa_edge->[-1];
+        my $state = $nfa_edge->[-1];
+        push @states, $state;
+        if (!defined $assert_info) {
+            for my $pc (@$nfa_edge) {
+                my $bc = $bytecodes[$pc];
+                if (ref $bc && $bc->[0] =~ /^(?:add|inc|del)cnt$/) {
+                    #warn "HIT $bc->[0]";
+                    push @actions, $bytecodes[$pc];
+                }
+            }
+        }
+    }
+
+    if (@actions) {
+        #warn "Found actions for edge ", gen_dfa_edge_label($from_node, $dfa_edge);
+        $dfa_edge->{actions} = \@actions;
     }
 
     my ($key, $target_dfa_node);
@@ -1188,6 +1217,15 @@ sub resolve_dfa_edge ($$$$$$$$) {
         }
     }
 
+    my %target_countings;
+    for my $state (@states) {
+        my $count = $counter_sets{$state};
+        if (defined $count) {
+            #warn "Found counting state: $state ($count)\n";
+            $target_countings{$state} = $count;
+        }
+    }
+
     my $is_accept;
     if ($accept_edges && @$accept_edges && @$nfa_edges == @$accept_edges
         && "@$nfa_edges" eq "@$accept_edges")
@@ -1209,7 +1247,8 @@ sub resolve_dfa_edge ($$$$$$$$) {
             ? (assert_info => $assert_info,
                orig_source => $from_node->{idx},
                nfa_edges => $nfa_edges)
-            : (nfa_nodes => $nfa_nodes),
+            : (nfa_nodes => $nfa_nodes,
+               %target_countings ? (countings => \%target_countings) : ()),
         edges => undef,
         states => \@states,
         idx => $$idx_ref++,
@@ -1250,7 +1289,7 @@ sub gen_dfa_edge ($$$$$) {
 
     # try to split the DFA edge if there are shadowed NFA edges mixed.
 
-    my (@unshadowed);
+    my @unshadowed;
     for my $nfa_edge (@$nfa_edges) {
         my $v = $shadowed_nfa_edges->{$nfa_edge};
         if (!$v) {
@@ -1286,6 +1325,8 @@ sub resolve_asserts ($) {
 
     # categorize NFA edges according to with assertions and without assertions
 
+    my %counting_asserts;
+    my @bad_counter_assert_mask;
     my (@assert_nfa_edges, %asserts);
     my $assert_idx = 0;
     my $row = 0;
@@ -1301,6 +1342,16 @@ sub resolve_asserts ($) {
                 $idx = $assert_idx++;
                 #warn "assert $assert not found, assigned a new index $idx";
                 $asserts{$assert} = $idx;
+                if ($assert =~ /^cnt (\d+)/) {
+                    my $id = $1;
+                    my $prev_idx = $counting_asserts{$id};
+                    if (defined $prev_idx) {
+                        #warn "Found invalid comb";
+                        push @bad_counter_assert_mask, (1 << $idx) | (1 << $prev_idx);
+                    } else {
+                        $counting_asserts{$id} = $idx;
+                    }
+                }
             } else {
                 #warn "assert $assert found existing index $idx";
             }
@@ -1311,6 +1362,17 @@ sub resolve_asserts ($) {
             $assert_nfa_edges[$row] = $mask;
         }
         $row++;
+    }
+
+    my %bad_assert_settings;
+    my $max_encoding = 2 ** $assert_idx - 1;
+    for (my $comb_encoding = 0; $comb_encoding <= $max_encoding; $comb_encoding++) {
+        for my $mask (@bad_counter_assert_mask) {
+            if (($comb_encoding & $mask) == 0) {
+                #warn "remove bad assert setting: $comb_encoding";
+                $bad_assert_settings{$comb_encoding} = 1;
+            }
+        }
     }
 
     #warn $assert_idx;
@@ -1326,6 +1388,7 @@ sub resolve_asserts ($) {
             assert_nfa_edges => \@assert_nfa_edges,
             uniq_assert_cnt => $assert_idx,
             asserts => \%asserts,
+            bad_assert_settings => \%bad_assert_settings,
         };
     }
 
@@ -1477,7 +1540,7 @@ sub draw_dfa ($) {
     my $dfa_nodes = $dfa->{nodes};
 
     my $big;
-    if (@$dfa_nodes >= 20) {
+    if (@$dfa_nodes >= 25) {
         $node_attr->{height} = 0.1;
         $edge_attr->{arrowsize} = 0.5;
         $big = 1;
@@ -1495,11 +1558,17 @@ sub draw_dfa ($) {
 
     for my $node (@$dfa_nodes) {
         my $idx = $node->{idx};
+        my $countings = $node->{countings};
+        my $style;
+        if ($countings) {
+            $style = 'filled,dashed';
+        }
         my $label = gen_dfa_node_label($node);
         $graph->add_node("n$idx", $node->{start} ? (color => 'orange') : (),
                          $node->{assert_info} ? (fillcolor => 'orange') : (),
                          $node->{accept} ? (shape => 'doublecircle') : (),
-                         label => $big ? '' : $label || " " . $label);
+                         label => $big ? '' : $label || " " . $label,
+                         defined $style ? (style => $style) : ());
     }
 
     for my $node (@$dfa_nodes) {
@@ -1527,6 +1596,17 @@ sub draw_dfa ($) {
 
 sub gen_dfa_edge_label ($$) {
     my ($from_node, $edge) = @_;
+    my $actions = $edge->{actions};
+    my $label_suffix = '';
+    if (defined $actions) {
+        my %map = (
+            addcnt => '+cnt',
+            delcnt => '-cnt',
+            inccnt => 'cnt++',
+            clrcnt => 'clrcnt',
+        );
+        $label_suffix .= "| " . join ",", map { $map{$_->[0]} // "unknown" } @$actions;
+    }
     my $assert_settings = $edge->{assert_settings};
     if (defined $assert_settings) {
         # must be the assert results
@@ -1535,22 +1615,35 @@ sub gen_dfa_edge_label ($$) {
         my @labels;
         for my $assert (sort keys %$asserts) {
             my $idx = $asserts->{$assert};
-            (my $label = $assert) =~ s/\\/\\\\/g;
+            my $label = $assert;
+            if ($label =~ /^cnt /) {
+                # assertions for counting FAs.
+                my @args = split / +/, $label;
+                my $op;
+                if ($args[-2] eq 'eq') {
+                    $op = '=';
+                } else {
+                    $op = '≠';
+                }
+                my $val = $args[-1];
+                $label = "cnt$op$val";
+            }
+            $label =~ s/\\/\\\\/g;
             if (!($assert_settings & (1 << $idx))) {
                 $label = "!$label";
             }
             push @labels, $label;
         }
         #warn "labels: @labels";
-        return join ",", @labels;
+        return join(",", @labels) . $label_suffix;
     }
     if ($edge->{to_accept}) {
         # epsilon edge to an "accept" state
-        return "ɛ";
+        return "ɛ" . $label_suffix;
     }
     my $ranges = $edge->{char_ranges};
     #warn "range size: ", scalar @bits;
-    return escape_range($ranges, 0);
+    return escape_range($ranges, 0) . $label_suffix;
 }
 
 sub gen_dfa_node_label ($) {
@@ -1558,9 +1651,9 @@ sub gen_dfa_node_label ($) {
     #if ($node->{start}) {
     #return "0";
     #}
-    my @lines = "{" . join(",", @{ $node->{states} }) . "}";
-    push @lines, "[" . $node->{idx} . "]";
-    if (defined $node->{min_len}) {
+    my @lines = "{" . join(",", uniq @{ $node->{states} }) . "}";
+    push @lines, $node->{idx};
+    if ($debug == 2 && defined $node->{min_len}) {
         push @lines, "∧=$node->{min_len}";
     }
     return join "\\n", @lines;
@@ -2396,7 +2489,7 @@ sub gen_c_from_dfa_edge ($$$$$) {
             } elsif ($assert eq '\z') {
                 $src .= $indent . 'asserts |= (c == -1) << ' . "$idx;\n";
             } else {
-                die "TODO";
+                die "TODO unknown assertion: $assert";
             }
             $src .= $indent . qq{fprintf(stderr, "assertion $assert test result: %d, idx = $idx, i = %d, c = %d\\n", asserts, i, c);\n}
                 if $debug;
@@ -2634,6 +2727,59 @@ sub analyze_dfa ($) {
 
     my $dfa_nodes = $dfa->{nodes};
 
+    # check DFA edges from counting states to non-counting states (per counting NFA state)
+    for my $node (@$dfa_nodes) {
+        my $countings = $node->{countings};
+        next unless defined $countings;
+        my $dfa_edges = $node->{edges};
+        my @edges = @$dfa_edges;
+        for (my $i = 0; $i < @edges; $i++) {
+            my $dfa_edge = $edges[$i];
+            if ($dfa_edge->{shadowing}) {
+                push @edges, $dfa_edge->{shadowing};
+            }
+            my @targets;
+            my $target = $dfa_edge->{target};
+            if (!defined $target->{nfa_nodes}) {
+                my $sub_edges = $target->{edges};
+                for my $sub_edge (@$sub_edges) {
+                    push @targets, [$sub_edge->{target}, $sub_edge];
+                }
+            } else {
+                push @targets, [$target, $dfa_edge];
+            }
+            for my $rec (@targets) {
+                my ($target, $dfa_edge) = @$rec;
+                my $target_countings = $target->{countings};
+                my $states = $target->{states};
+                for my $nfa_state (sort keys %$countings) {
+                    if (!defined $target_countings || !$target_countings->{$nfa_state}) {
+                        #warn "Found clearing edge from $node->{idx} to $target->{idx} ",
+                        #"for counter set $nfa_state\n";
+                        my $actions = $dfa_edge->{actions};
+                        if (!defined $actions) {
+                            $actions = [["clrcnt", $nfa_state]];
+                            $dfa_edge->{actions} = $actions;
+                        } else {
+                            my $modified;
+                            for my $a (@$actions) {
+                                if ($a->[0] eq 'delcnt' && $a->[1] == $nfa_state) {
+                                    #warn "remove redundant delcnt $nfa_state";
+                                    undef $a;
+                                    $modified = 1;
+                                }
+                            }
+                            push @$actions, ["clrcnt", $nfa_state];
+                            if ($modified) {
+                                @$actions = grep { defined } @$actions;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     # compute min/max length of input string consumed for each DFA node.
     for my $node (@$dfa_nodes) {
         if ($node->{start}) {
@@ -2863,6 +3009,10 @@ sub rewrite_repetitions ($) {
         }
     } continue {
         $pc++;
+    }
+
+    if ($found) {
+        $used_asserts = 1;
     }
 
     return $found;
