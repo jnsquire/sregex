@@ -78,6 +78,8 @@ use POSIX qw( tmpnam );
 use File::Spec ();
 use FindBin ();
 
+sub rewrite_repetitions ($);
+sub as_in_range_bytecode ($$);
 sub add_nfa_edges ($$$$);
 sub gen_nfa_edge_label ($);
 sub escape_char ($);
@@ -109,6 +111,7 @@ sub gen_c_from_dfa_node ($$);
 sub dump_code ($);
 sub count_chars_and_holes_in_ranges ($);
 sub analyze_dfa ($);
+sub dump_bytecode ($);
 
 my $cc = "cc";
 my $debug = 0;
@@ -219,6 +222,12 @@ while (<$in>) {
 
 close $in;
 
+my $n = rewrite_repetitions(\@bytecodes);
+if ($n > 0 && $debug) {
+    print "Rewrote $n repetitions. New bytecode dump:\n";
+    print dump_bytecode(\@bytecodes);
+}
+
 #warn Dumper \@bytecodes;
 
 my %cached_labels;
@@ -271,6 +280,7 @@ my $edge_attr =
 my %nfa_paths;
 my %pc2assert;
 my $used_asserts;
+my %counter_sets;
 
 #my $begin = time;
 my $nfa = gen_nfa();
@@ -367,6 +377,7 @@ sub gen_nfa () {
     my $max_cap = 0;
     my $idx = 0;
     for my $bc (@bytecodes) {
+        next unless defined $bc;
         my $opcode = opcode($bc);
         if ($opcode eq 'assert') {
             $used_asserts = 1;
@@ -411,6 +422,7 @@ sub gen_nfa () {
     for my $node (@nodes) {
         my %visited;
         my $idx = $node->{idx};
+        next if $node->{accept};
         add_nfa_edges($node, $idx == 0 ? 0 : $idx + 1, \%visited, undef);
     }
 
@@ -445,18 +457,25 @@ sub draw_nfa ($) {
     #$graph->as_dot("nfa.dot");
     for my $node (@$nfa_nodes) {
         my $idx = $node->{idx};
+        my $style;
+        if (defined $counter_sets{$idx}) {
+            $style = "filled,dashed";
+        }
         $graph->add_node("n$idx", $node->{start} ? (color => 'orange') : (),
                          $node->{accept} ? (shape => 'doublecircle') : (),
-                         label => $big ? '' : $idx || " $idx");
+                         label => $big ? '' : $idx || " $idx",
+                         defined $style ? (style => $style) : ());
     }
     for my $node (@$nfa_nodes) {
         my $from_idx = $node->{idx};
         my $e_idx = 0;
         for my $e (@{ $node->{edges} }) {
-            my $label = gen_nfa_edge_label($e);
+            my ($label, $style) = gen_nfa_edge_label($e);
             my $to_idx = $e->[-1];
             my $color = $edge_colors[$e_idx] || 'black';
-            $graph->add_edge("n$from_idx" => "n$to_idx", label => $label, color => $color, len => 1.6);
+            $graph->add_edge("n$from_idx" => "n$to_idx", label => $label,
+                             color => $color, len => 1.6,
+                             defined $style ? (style => $style) : ());
             $e_idx++;
         }
     }
@@ -471,6 +490,23 @@ sub add_nfa_edges ($$$$) {
     return unless defined $bc;
 
     my $opcode = opcode($bc);
+
+    if ($opcode eq 'nop') {
+        for ($idx++; $idx < @bytecodes; $idx++) {
+            $bc = $bytecodes[$idx];
+            if (!ref $bc && $bc eq 'nop') {
+                next;
+            }
+            # found the boundary.
+            $opcode = opcode($bc);
+            last;
+        }
+        if ($opcode eq 'nop') {
+            return;
+        }
+        warn "skipped NOP and reached bytecode $idx: $opcode";
+    }
+
     if (exists $visited->{$idx}) {
         if ($opcode eq 'split') {
             my $y = $bc->[2];
@@ -501,7 +537,7 @@ sub add_nfa_edges ($$$$) {
         goto \&add_nfa_edges;
     }
 
-    if ($opcode eq 'save' or $opcode eq 'assert') {
+    if ($opcode eq 'save' or $opcode eq 'assert' or $opcode =~ /^(?:add|inc|del)cnt$/) {
         #warn Dumper \$bc;
         if (!defined $to_nodes) {
             $to_nodes = [];
@@ -541,43 +577,84 @@ sub bc_is_nfa_node ($) {
 
 sub gen_nfa_edge_label ($) {
     my ($e) = @_;
+    my $total_consuming;
+    my @styles;
     my @labels;
     for my $idx (@$e) {
         my $bc = $bytecodes[$idx];
         my $opcode = opcode($bc);
-        my $label = $cached_labels{$bc};
-        if (!defined $label) {
+        #warn "opcode: $opcode\n";
+        my $info = $cached_labels{$bc};
+        my ($label, $consuming, $style);
+        if (defined $info) {
+            ($label, $consuming, $style) = @$info;
+        } else {
             my $v = ref $bc ? $bc->[1] : undef;
             if ($opcode eq 'assert') {
-                $label = $v;
+                if ($v eq 'cnt') {
+                    my $op = $bc->[-2];
+                    my $n = $bc->[-1];
+                    if ($op eq 'n ne') {
+                        $op = '≠';
+                    } else {
+                        $op = '=';
+                    }
+                    $label = "cnt$op$n";
+
+                } else {
+                    $label = $v;
+                }
             } elsif ($opcode eq 'any') {
                 $label = '*';
+                $consuming = 1;
             } elsif ($opcode eq 'char') {
                 $label = "'" . escape_char($v) . "'";
+                $consuming = 1;
             } elsif ($opcode eq 'in') {
                 my @args = @$bc;
                 shift @args;
                 $label = escape_range(\@args, 0);
+                $consuming = 1;
             } elsif ($opcode eq 'notin') {
                 my @args = @$bc;
                 shift @args;
                 $label = escape_range(\@args, 1);
+                $consuming = 1;
             } elsif ($opcode eq 'save') {
                 my $i = int($v / 2);
                 my $sym = $v % 2 == 0 ? '(' : ')';
                 $label = "$sym$i";
             } elsif ($opcode eq 'match') {
-                $label = "";
+                #$label = "ε";
+            } elsif ($opcode eq 'addcnt') {
+                $style = "dashed";
+            } elsif ($opcode eq 'delcnt') {
+                $label = "-cnt";
+            } elsif ($opcode eq 'inccnt') {
+                $label ="cnt++";
             } else {
                 die "unknown opcode: $opcode";
             }
 
-            $cached_labels{$bc} = $label;
+            $cached_labels{$bc} = [$label, $consuming, $style];
         }
-        $label =~ s/\\/\\\\/g;
-        push @labels, $label;
+        if ($consuming) {
+            $total_consuming = 1;
+        }
+        if (defined $style) {
+            push @styles, $style;
+        }
+        #$label =~ s/\\/\\\\/g;
+        if (defined $label) {
+            push @labels, $label;
+        }
     }
-    return join " ", @labels;
+    #warn "consuming: $consuming, labels: @labels";
+    if ($total_consuming && @labels > 1) {
+        my $input = pop @labels;
+        return "$input| " . join(",", @labels), join ",", @styles;
+    }
+    return join(",", @labels), join ",", @styles;
 }
 
 sub escape_char ($) {
@@ -2645,4 +2722,148 @@ sub analyze_dfa ($) {
         #warn "removed $changes unreacheable nodes.\n";
         @$dfa_nodes = grep { defined } @$dfa_nodes;
     }
+}
+
+sub dump_bytecode ($) {
+    my ($bytecodes) = @_;
+    my $n = length scalar @$bytecodes;
+    my $pc = 0;
+    my $s = '';
+    for my $bc (@$bytecodes) {
+        $s .= sprintf "%${n}d. ", $pc;
+        if (ref $bc) {
+            $s .= "@$bc\n";
+        } elsif (defined $bc) {
+            $s .= "$bc\n";
+        } else {
+            $s .= "nop\n";
+        }
+    } continue {
+        $pc++;
+    }
+    return $s;
+}
+
+sub as_in_range_bytecode ($$) {
+    my ($opcode, $args) = @_;
+    if ($opcode eq 'in') {
+        return ['in', @$args];
+    }
+    if ($opcode eq 'any') {
+        return ["in", 0, 255];
+    }
+    if ($opcode eq 'char') {
+        my $c = $args->[0];
+        return ['in', $c, $c];
+    }
+    if ($opcode eq 'notin') {
+        my $from = 0;
+        my $found = 0;
+        my @new_args;
+        for (my $i = 0; $i < @$args; $i += 2) {
+            my ($a, $b)  = ($args->[$i], $args->[$i + 1]);
+            if ($from <= $a - 1) {
+                push @new_args, $from, $a - 1;
+            }
+            $from = $b + 1;
+            $found++;
+        }
+        if ($found && $from <= 255) {
+            push @new_args, $from, 255;
+        }
+        return ['in', @new_args];
+    }
+    die "unknown opcode: $opcode\n";
+}
+
+sub rewrite_repetitions ($) {
+    my $bytecodes = shift;
+    my $found = 0;
+
+    my ($prev_args, $prev_args_str, $prev_opcode, $start_pc, $count);
+    my $pc = 0;
+    for my $bc (@$bytecodes) {
+        if (defined $prev_opcode) {
+            my $opcode = opcode($bc);
+            #warn "opcode: $opcode, prev opcode: $prev_opcode";
+            if ($opcode eq $prev_opcode) {
+                if ($opcode eq 'any') {
+                    #warn "Found successive any";
+                    $count++;
+                    next;
+                }
+                my @args = @$bc;
+                shift @args;
+                my $args_str = join ",", @args;
+                if ($args_str eq $prev_args_str) {
+                    $count++;
+                    next;
+                }
+            }
+
+            # found right boundary
+            #warn "Found $count $pc";
+            if ($count >= 2) {  # TODO: we need a more sensible threshold here
+                $found++;
+                #warn "HIT";
+                my $bc = as_in_range_bytecode($prev_opcode, $prev_args);
+
+                # directly fill the gap instead of appending to the bytecode
+                # program if the gap is big enough.
+                my $use_gap;
+                if ($count >= 8) {
+                    $use_gap = 1;
+                }
+                my $end = $use_gap ? $start_pc + 1 : @$bytecodes;
+                my $counter_id = $end + 1;
+                $counter_sets{$counter_id} = $count;
+                $bytecodes->[$start_pc] = ["addcnt", $counter_id, $count];
+                $start_pc++;
+                if (!$use_gap) {
+                    $bytecodes->[$start_pc] = ["jmp", $end];
+                    $start_pc++;
+                }
+                my $saved_pc = $pc;
+                my $pc = $end;
+                $bytecodes->[$pc++] = ["inccnt", $counter_id];
+                $bytecodes->[$pc++] = $bc;
+                $bytecodes->[$pc++] = ["split", $pc + 1, $pc + 3];
+                $bytecodes->[$pc++] = ["assert", "cnt", $counter_id, "n ne", $count];
+                $bytecodes->[$pc++] = ["jmp", $counter_id - 1];
+                $bytecodes->[$pc++] = ["assert", "cnt", $counter_id, "n eq", $count];
+                $bytecodes->[$pc++] = ["delcnt", $counter_id];
+                if (!$use_gap) {
+                    $bytecodes->[$pc++] = ["jmp", $saved_pc];
+                } else {
+                    $start_pc = $pc;
+                }
+                for (my $i = $start_pc; $i < $saved_pc; $i++) {
+                    $bytecodes->[$i] = "nop";
+                }
+            }
+
+            undef $prev_opcode;
+            undef $prev_args;
+        }
+
+        if (!defined $prev_opcode) {
+            my $opcode = opcode($bc);
+            if ($opcode =~ /^(?:char|any|(?:not)?in)$/) {
+                $count = 1;
+                $start_pc = $pc;
+                $prev_opcode = $opcode;
+                if ($opcode eq 'any') {
+                    next;
+                }
+                my @args = @$bc;
+                shift @args;
+                $prev_args = \@args;
+                $prev_args_str = join ",", @args;
+            }
+        }
+    } continue {
+        $pc++;
+    }
+
+    return $found;
 }
