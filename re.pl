@@ -1236,6 +1236,11 @@ sub resolve_asserts ($) {
     #warn $assert_idx;
 
     if ($assert_idx) {
+        if ($assert_idx > 64) {
+            die "Too many assertions: a $assert_idx-bit bitmap is required ",
+                "but at most 64-bit is supported.\n";
+        }
+
         #warn "asserts: ", Dumper(%asserts);
         return {
             assert_nfa_edges => \@assert_nfa_edges,
@@ -1534,6 +1539,7 @@ sub gen_c_from_dfa ($) {
 
     my $src = <<_EOC_;
 #include <stdlib.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <ctype.h>
 #include <errno.h>
@@ -2206,7 +2212,7 @@ sub gen_c_from_dfa_edge ($$$$$) {
     my $indent = $indents[$indent_idx];
     if (defined $assert_info) {
         my $asserts = $assert_info->{asserts};
-        $src .= $indent . "int asserts = 0;\n";
+        $src .= $indent . "uint64_t asserts = 0;\n";
         my $min_len = $from_node->{min_len} // die;
         for my $assert (sort keys %$asserts) {
             my $idx = $asserts->{$assert};
