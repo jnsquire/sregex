@@ -2388,13 +2388,13 @@ sub gen_capture_handler_c_code ($$$$) {
     my $src = '';
     my $target = $edge->{target};
     my $mappings = $edge->{capture_mappings};
-    my $target_actions = $edge->{nfa_edges};
+    my $nfa_edges = $edge->{nfa_edges};
 
     my (%to_save_rows, %overwritten, @stores, %to_be_stored);
     for my $mapping (@$mappings) {
         my ($from_row, $to_row) = @$mapping;
 
-        my $nfa_edge = $target_actions->[$to_row];
+        my $nfa_edge = $nfa_edges->[$to_row];
         for my $pc (@$nfa_edge) {
             my $bc = $bytecodes[$pc];
             my $bcname = opcode($bc);
