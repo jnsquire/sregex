@@ -59,7 +59,7 @@ extern int sregex_yydebug;
 
 union YYSTYPE
 {
-#line 82 "src/sregex/sre_yyparser.y"
+#line 87 "src/sregex/sre_yyparser.y"
 
     sre_regex_t         *re;
     sre_char             ch;

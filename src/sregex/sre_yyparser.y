@@ -20,6 +20,11 @@
 #include <sregex/sre_regex.h>
 
 
+enum {
+    MAX_COUNT_CONSTRAINT = 4096
+};
+
+
 #define YYLTYPE YYLTYPE
 typedef struct YYLTYPE {
     sre_char  *pos;
@@ -1714,7 +1719,7 @@ process_char:
 cquant_parsed:
         dd("from = %d, to = %d, next: %d", from, to, (*src)[0]);
 
-        if (from >= 500 || to >= 500) {
+        if (from > MAX_COUNT_CONSTRAINT || to > MAX_COUNT_CONSTRAINT) {
             dd("from or to too large: %d %d", from, to);
             locp->last = *src;
             return SRE_REGEX_TOKEN_BAD;
