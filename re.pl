@@ -265,6 +265,7 @@ my $nfa = gen_nfa();
 #my $elapsed = time - $begin;
 #warn "NFA generated ($elapsed sec).\n";
 #warn Dumper($nfa);
+warn scalar @{ $nfa->{nodes} }, " NFA nodes found.\n" if $debug;
 draw_nfa($nfa) if $debug;
 
 #$begin = time;
@@ -272,6 +273,8 @@ my $dfa = gen_dfa($nfa);
 #$elapsed = time - $begin;
 #warn "DFA generated ($elapsed sec).\n";
 analyze_dfa($dfa);
+
+warn scalar @{ $dfa->{nodes} }, " DFA nodes found.\n" if $debug;
 
 #warn Dumper($dfa);
 draw_dfa($dfa) if $debug;
@@ -533,7 +536,7 @@ sub gen_nfa_edge_label ($) {
             if ($opcode eq 'assert') {
                 $label = $v;
             } elsif ($opcode eq 'any') {
-                $label = 'any';
+                $label = '*';
             } elsif ($opcode eq 'char') {
                 $label = "'" . escape_char($v) . "'";
             } elsif ($opcode eq 'in') {
@@ -1478,6 +1481,9 @@ sub escape_range ($$) {
         if (@$range == 2) {
             if ($range->[0] == $range->[1]) {
                 return "'" . escape_char($range->[0]) . "'";
+            }
+            if ($range->[0] == 0 && $range->[1] == 255) {
+                return '*';
             }
         }
         $s = "[";
