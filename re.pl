@@ -84,7 +84,7 @@ sub escape_char ($);
 sub escape_range_char ($);
 sub gen_nfa ();
 sub draw_nfa ($);
-sub is_node ($);
+sub bc_is_nfa_node ($);
 sub opcode ($);
 sub gen_dfa_edges ($$$$$$);
 sub gen_dfa ($);
@@ -382,7 +382,7 @@ sub gen_nfa () {
             }
         }
 
-        $opcode = is_node($bc);
+        $opcode = bc_is_nfa_node($bc);
         if (defined $opcode || $idx == 0) {
             my $node = {
                 idx => $idx,
@@ -527,7 +527,7 @@ sub opcode ($) {
     return ref $bc ? $bc->[0] : $bc;
 }
 
-sub is_node ($) {
+sub bc_is_nfa_node ($) {
     my ($bc) = @_;
     my $opcode = opcode($bc);
     if ($opcode =~ /^(?:char|notin|in|any|match)$/) {
