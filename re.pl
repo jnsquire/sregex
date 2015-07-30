@@ -10,6 +10,18 @@
 # external C compiler toolchain (like gcc/clang/tcc) to
 # compile the resulting C programs.
 #
+# To run this script, you need to build sregex by the following
+# command:
+#
+#   make
+#
+# Also, you need to install those Perl CPAN modules this script
+# depends on via the following command:
+#
+#   cpan GraphViz IPC::Run3 List::MoreUtils
+#
+# And you need to have the C compiler toolchain in your system.
+#
 # Usge examples:
 #
 #   $ ./re.pl 'a(b)|a' 'caba'
