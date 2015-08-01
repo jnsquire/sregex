@@ -106,6 +106,7 @@ sub gen_dfa_edge ($$$$$);
 sub resolve_dfa_edge ($$$$$$$$);
 sub gen_dfa_edges_for_asserts ($$$$$$);
 sub gen_capture_handler_c_code ($$$$);
+sub gen_edge_action_c_code ($$);
 sub gen_c_from_dfa_edge ($$$$$);
 sub gen_c_from_dfa_node ($$);
 sub dump_code ($);
@@ -135,7 +136,11 @@ if (!defined $timer) {
 }
 
 if (!$repeat) {
-    $repeat = 5;
+    if ($timer) {
+        $repeat = 5;
+    } else {
+        $repeat = 1;
+    }
 }
 
 $Data::Dumper::Terse = 1;
@@ -255,6 +260,19 @@ my %escaped_chars = (
     "\e" => '\e',
     "\f" => '\f',
     "\\" => "\\\\",
+);
+
+my %action_prio = (
+    #delcnt => 0,
+    addcnt => 1,
+    inccnt => 2,
+);
+
+my %action_labels = (
+    addcnt => '+cnt',
+    #delcnt => '-cnt',
+    inccnt => 'cnt++',
+    clrcnt => 'clrcnt',
 );
 
 my @edge_colors = qw(
@@ -633,9 +651,9 @@ sub gen_nfa_edge_label ($) {
             } elsif ($opcode eq 'match') {
                 #$label = "ε";
             } elsif ($opcode eq 'addcnt') {
-                $style = "dashed";
-            } elsif ($opcode eq 'delcnt') {
-                $label = "-cnt";
+                $label = "+cnt";
+            #} elsif ($opcode eq 'delcnt') {
+                #$label = "-cnt";
             } elsif ($opcode eq 'inccnt') {
                 $label ="cnt++";
             } else {
@@ -849,7 +867,9 @@ sub calc_capture_mapping ($$) {
     my $src_states = $from_node->{states};
     my (@mappings, %assigned);
     my $from_row = 0;
-    #warn "source state: ", join(",", @$src_states), " => ", gen_dfa_node_label($dfa_edge->{target}), "\n";
+    #warn "src $from_node->{idx} {", join(",", @$src_states),
+        #"} => dst $dfa_edge->{target}{idx} ",
+    #gen_dfa_node_label($dfa_edge->{target}), "\n";
     for my $src_state (@$src_states) {
         my $to_row = 0;
         for my $nfa_edge (@$nfa_edges) {
@@ -1169,24 +1189,37 @@ sub resolve_dfa_edge ($$$$$$$$) {
     }
     #warn "DFA edge target: ", Dumper($nfa_edges);
 
+    my @actions;
+    {
+        my %seen;
+        for my $nfa_edge (@$nfa_edges) {
+            if (!defined $assert_info) {
+                for my $pc (@$nfa_edge) {
+                    my $bc = $bytecodes[$pc];
+                    if (ref $bc && $bc->[0] =~ /cnt/) {
+                        #warn "HIT $bc->[0]";
+                        if (!$seen{$pc}) {
+                            push @actions, $bytecodes[$pc];
+                            $seen{$pc} = 1;
+                        }
+                    }
+                }
+            }
+        }
+        if (@actions) {
+            @actions = sort { $action_prio{$a->[0]} <=> $action_prio{$b->[0]} } @actions;
+        }
+    }
+
     if (!defined $assert_info) {
         $nfa_edges = dedup_nfa_edges($nfa_edges);
         $dfa_edge->{nfa_edges} = $nfa_edges;
     }
 
-    my (@states, @actions);
+    my @states;
     for my $nfa_edge (@$nfa_edges) {
         my $state = $nfa_edge->[-1];
         push @states, $state;
-        if (!defined $assert_info) {
-            for my $pc (@$nfa_edge) {
-                my $bc = $bytecodes[$pc];
-                if (ref $bc && $bc->[0] =~ /^(?:add|inc|del)cnt$/) {
-                    #warn "HIT $bc->[0]";
-                    push @actions, $bytecodes[$pc];
-                }
-            }
-        }
     }
 
     if (@actions) {
@@ -1599,13 +1632,7 @@ sub gen_dfa_edge_label ($$) {
     my $actions = $edge->{actions};
     my $label_suffix = '';
     if (defined $actions) {
-        my %map = (
-            addcnt => '+cnt',
-            delcnt => '-cnt',
-            inccnt => 'cnt++',
-            clrcnt => 'clrcnt',
-        );
-        $label_suffix .= "| " . join ",", map { $map{$_->[0]} // "unknown" } @$actions;
+        $label_suffix .= "| " . join ",", map { $action_labels{$_->[0]} // "unknown" } @$actions;
     }
     my $assert_settings = $edge->{assert_settings};
     if (defined $assert_settings) {
@@ -1730,6 +1757,8 @@ $getcputime
 #endif
 
 #define u_char          unsigned char
+#
+#define nelems(arr)     (sizeof(arr) / sizeof((arr)[0]))
 
 
 enum {
@@ -1932,6 +1961,18 @@ _EOC_
         }
     }
 
+    # emit counter sets
+    for my $id (sort keys %counter_sets) {
+        my $count = $counter_sets{$id};
+        my $ncounters = $count;
+        $src .= <<_EOC_;
+
+    short       counter_set_$id\[$ncounters];
+    short      *oldest_counter_for_$id = counter_set_$id;
+    short      *next_counter_for_$id = counter_set_$id;
+_EOC_
+    }
+
     for my $node (@$dfa_nodes) {
         next if defined $node->{assert_info} || $node->{accept};
         $src .= gen_c_from_dfa_node($node, $nvec);
@@ -1961,7 +2002,7 @@ sub gen_c_from_dfa_node ($$) {
 
     my $edges = $node->{edges};
 
-    $src .= qq{    fprintf(stderr, "entering state $label\\n");\n} if $debug;
+    $src .= qq{    fprintf(stderr, "* entering state $label\\n");\n} if $debug;
 
     my $used_error;
 
@@ -2167,7 +2208,7 @@ _EOC_
         if ($edges->[0]{to_accept}) {
             $src .= "    c = i < len ? s[i++] : (i++, -1);\n";
             if ($debug) {
-                $src .= qq{     fprintf(stderr, "reading new char \\"%d\\"\\n", c);\n};
+                $src .= qq{    fprintf(stderr, "reading new char \\"%d\\"\\n", c);\n};
             }
 
             $to_accept = 1;
@@ -2383,6 +2424,7 @@ sub gen_c_from_dfa_edge ($$$$$) {
 
     my $assert_info = $target->{assert_info};
     my $indent = $indents[$indent_idx];
+
     if (defined $assert_info) {
         my $asserts = $assert_info->{asserts};
         $src .= $indent . "uint64_t asserts = 0;\n";
@@ -2488,10 +2530,25 @@ sub gen_c_from_dfa_edge ($$$$$) {
                                    . "$idx;\n";
             } elsif ($assert eq '\z') {
                 $src .= $indent . 'asserts |= (c == -1) << ' . "$idx;\n";
+            } elsif ($assert =~ /^cnt /) {
+                my @args = split /\s+/, $assert;
+                #die "args: @args";
+                my $set_id = $args[1];
+                my $n = $args[-1];
+                my $op = $args[-2];
+                # TODO: we could avoid duplicate evaluations if the both sides of the assertions
+                # exist in a single DFA edge.
+                if ($op eq 'eq') {
+                    $src .= $indent . "asserts |= (*oldest_counter_for_$set_id == $n) << $idx;\n";
+                } else {
+                    $src .= $indent . "asserts |= (*oldest_counter_for_$set_id != $n "
+                            . "|| next_counter_for_$set_id - oldest_counter_for_$set_id > 1) << $idx;\n";
+                }
+                #warn "Found assertion $assert";
             } else {
                 die "TODO unknown assertion: $assert";
             }
-            $src .= $indent . qq{fprintf(stderr, "assertion $assert test result: %d, idx = $idx, i = %d, c = %d\\n", asserts, i, c);\n}
+            $src .= $indent . qq{fprintf(stderr, "assertion $assert test result: %lld, idx = $idx, i = %d, c = %d\\n", (long long) asserts, i, c);\n}
                 if $debug;
         }
 
@@ -2515,6 +2572,10 @@ sub gen_c_from_dfa_edge ($$$$$) {
             if ($target->{accept}) {
                 $to_accept = 1;
             }
+            if (!$to_accept) {
+                # we don't care about cleanup for to-accept states.
+                $src .= gen_edge_action_c_code($subedge, $indent2);
+            }
             $src .= gen_capture_handler_c_code($subedge, $target->{accept}, $indent2, $nvec);
             my $to = $target->{idx};
             if (!$to_accept) {
@@ -2526,6 +2587,7 @@ sub gen_c_from_dfa_edge ($$$$$) {
     } else {
         # normal DFA edge w/o assertions
 
+        $src .= gen_edge_action_c_code($edge, $indent);
         $src .= gen_capture_handler_c_code($edge, $to_accept, $indent, $nvec);
 
         my $to = $target->{idx};
@@ -2761,18 +2823,18 @@ sub analyze_dfa ($) {
                             $actions = [["clrcnt", $nfa_state]];
                             $dfa_edge->{actions} = $actions;
                         } else {
-                            my $modified;
-                            for my $a (@$actions) {
-                                if ($a->[0] eq 'delcnt' && $a->[1] == $nfa_state) {
+                            #my $modified;
+                            #for my $a (@$actions) {
+                                #if ($a->[0] eq 'delcnt' && $a->[1] == $nfa_state) {
                                     #warn "remove redundant delcnt $nfa_state";
-                                    undef $a;
-                                    $modified = 1;
-                                }
-                            }
+                                    #undef $a;
+                                    #$modified = 1;
+                                #}
+                            #}
                             push @$actions, ["clrcnt", $nfa_state];
-                            if ($modified) {
-                                @$actions = grep { defined } @$actions;
-                            }
+                            #if ($modified) {
+                                #@$actions = grep { defined } @$actions;
+                            #}
                         }
                     }
                 }
@@ -2781,6 +2843,8 @@ sub analyze_dfa ($) {
     }
 
     # compute min/max length of input string consumed for each DFA node.
+    # TODO: add proper support for the counting FA states.
+
     for my $node (@$dfa_nodes) {
         if ($node->{start}) {
             $node->{min_len} = 0;
@@ -2926,13 +2990,27 @@ sub rewrite_repetitions ($) {
     my $bytecodes = shift;
     my $found = 0;
 
+    # find jump targets;
+    my %jmp_targets;
+    for my $bc (@$bytecodes) {
+        if (ref $bc) {
+            my $op = $bc->[0];
+            if ($op eq 'jmp') {
+                $jmp_targets{$bc->[1]}++;
+            } elsif ($op eq 'split') {
+                $jmp_targets{$bc->[1]}++;
+                $jmp_targets{$bc->[2]}++;
+            }
+        }
+    }
+
     my ($prev_args, $prev_args_str, $prev_opcode, $start_pc, $count);
     my $pc = 0;
     for my $bc (@$bytecodes) {
         if (defined $prev_opcode) {
             my $opcode = opcode($bc);
             #warn "opcode: $opcode, prev opcode: $prev_opcode";
-            if ($opcode eq $prev_opcode) {
+            if ($opcode eq $prev_opcode && !$jmp_targets{$pc}) {
                 if ($opcode eq 'any') {
                     #warn "Found successive any";
                     $count++;
@@ -2957,7 +3035,7 @@ sub rewrite_repetitions ($) {
                 # directly fill the gap instead of appending to the bytecode
                 # program if the gap is big enough.
                 my $use_gap;
-                if ($count >= 8) {
+                if ($count >= 7) {
                     $use_gap = 1;
                 }
                 my $end = $use_gap ? $start_pc + 1 : @$bytecodes;
@@ -2977,7 +3055,7 @@ sub rewrite_repetitions ($) {
                 $bytecodes->[$pc++] = ["assert", "cnt", $counter_id, "n ne", $count];
                 $bytecodes->[$pc++] = ["jmp", $counter_id - 1];
                 $bytecodes->[$pc++] = ["assert", "cnt", $counter_id, "n eq", $count];
-                $bytecodes->[$pc++] = ["delcnt", $counter_id];
+                #$bytecodes->[$pc++] = ["delcnt", $counter_id];
                 if (!$use_gap) {
                     $bytecodes->[$pc++] = ["jmp", $saved_pc];
                 } else {
@@ -3016,4 +3094,106 @@ sub rewrite_repetitions ($) {
     }
 
     return $found;
+}
+
+# FIXME: for now, we only have actions for counters.
+# strictly speaking, capture handlings are also
+# a kind of "actions". we might clear up the
+# naming here in the future.
+sub gen_edge_action_c_code ($$) {
+    my ($edge, $indent) = @_;
+    my $actions = $edge->{actions};
+    my %inccnt;
+    my $src = '';
+
+    for my $action (@$actions) {
+        my ($op, $set_id) = @$action;
+        if ($op eq 'inccnt') {
+            $inccnt{$set_id}++;
+        }
+    }
+
+    for my $set_id (sort keys %inccnt) {
+        my $count = $counter_sets{$set_id};
+        # TODO: skip this operation if clrcnt is present.
+        # TODO: remove the following branch test if possible
+        $src .= <<_EOC_;
+${indent}if (*oldest_counter_for_$set_id == $count) {
+${indent}    oldest_counter_for_$set_id++;
+_EOC_
+
+        if ($debug) {
+            $src .= <<_EOC_;
+${indent}    fprintf(stderr, "action: delcnt $set_id (olest counter: %d, %d counters).\\n",
+${indent}            (int) *oldest_counter_for_$set_id,
+${indent}            (int) (next_counter_for_$set_id - oldest_counter_for_$set_id));
+_EOC_
+        }
+
+        $src .= <<_EOC_;
+${indent}}
+_EOC_
+    }
+
+    for my $action (@$actions) {
+        my ($op, $set_id) = @$action;
+        #warn "action: $op $set_id";
+        if ($op eq 'addcnt') {
+            $src .= <<_EOC_;
+${indent}if (unlikely(next_counter_for_$set_id - counter_set_$set_id >= nelems(counter_set_$set_id))) {
+${indent}    size_t     size;
+${indent}    size = next_counter_for_$set_id - oldest_counter_for_$set_id;
+${indent}    oldest_counter_for_$set_id = memmove(counter_set_$set_id,
+${indent}                                         oldest_counter_for_$set_id, size);
+${indent}    next_counter_for_$set_id -= size;
+_EOC_
+
+            if ($debug) {
+                $src .= qq{${indent}fprintf(stderr, "re-organize counter set $set_id.\\n");\n};
+            }
+
+            $src .= <<_EOC_;
+${indent}}
+${indent}*next_counter_for_$set_id++ = 0;
+_EOC_
+        } elsif ($op eq 'inccnt') {
+            $src .= <<_EOC_;
+${indent}{
+${indent}    short     *p;
+${indent}    for (p = oldest_counter_for_$set_id; p < next_counter_for_$set_id; p++) {
+${indent}        (*p)++;
+${indent}    }
+${indent}}
+_EOC_
+        } elsif ($op eq 'delcnt') {
+            #$src .= "${indent}oldest_counter_for_$set_id++;\n";
+        } else {
+            die "unknown action: @$action" if $op ne 'clrcnt';
+            $src .= "${indent}next_counter_for_$set_id = oldest_counter_for_$set_id = counter_set_$set_id;\n";
+        }
+        if ($debug) {
+            $src .= <<_EOC_;
+${indent}    fprintf(stderr, "action: @$action (olest counter: %d, %d counters).\\n",
+${indent}            (int) *oldest_counter_for_$set_id,
+${indent}            (int) (next_counter_for_$set_id - oldest_counter_for_$set_id));
+_EOC_
+        }
+    }
+
+    if ($debug) {
+        for my $set_id (sort keys %inccnt) {
+            $src .= <<_EOC_;
+${indent}{
+${indent}    short   *p;
+${indent}    fprintf(stderr, "counter set $set_id:\\n");
+${indent}    for (p = oldest_counter_for_$set_id; p < next_counter_for_$set_id; p++) {
+${indent}        fprintf(stderr, "  counter #%d = %d\\n",
+${indent}                (int) (p - oldest_counter_for_$set_id + 1), (int) *p);
+${indent}    }
+${indent}}
+_EOC_
+        }
+    }
+
+    return $src;
 }
