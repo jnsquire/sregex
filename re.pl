@@ -875,14 +875,23 @@ sub calc_capture_mapping ($$) {
         #"} => dst $dfa_edge->{target}{idx} ",
     #gen_dfa_node_label($dfa_edge->{target}), "\n";
     for my $src_state (@$src_states) {
-        my $to_row = 0;
+        my $to_row_cnt = 0;
+        my %seen_dst_state;
         for my $nfa_edge (@$nfa_edges) {
             my $to_pc = $nfa_edge->[0]; # first NFA node in the NFA edge, not the last one
+            my $dst_state = $nfa_edge->[-1];
+            my $to_row = $seen_dst_state{$dst_state};
+            if (!defined $to_row) {
+                $seen_dst_state{$dst_state} = 1;
+                $to_row = $to_row_cnt;
+            } else {
+                $to_row_cnt--;
+            }
             my $key = "$src_state-$to_pc";
             if (!$assigned{$to_row} && $nfa_paths{$key}) {
                 my $src_counting = $counter_sets{$src_state};
                 if (defined $src_counting) {
-                    my $dst_counting = $counter_sets{$nfa_edge->[-1]}; # here we must use the last one
+                    my $dst_counting = $counter_sets{$dst_state}; # here we must use the last one
                     if (defined $dst_counting && $dst_counting == $src_counting) {
                         # skip mapping counter state to the same counter state
                         # since the mapping is implicit by keeping the same
@@ -890,7 +899,10 @@ sub calc_capture_mapping ($$) {
                         # more importantly, we prevent this useless edge from
                         # hiding subsequent edges with "addcnt" actions which
                         # does real jobs.
+                        #warn "@$bc";
+                        #warn "  skipped mapping: $from_row => $to_row\n";
                         next;
+                        #warn "  mapping: $from_row => $to_row\n";
                     }
                 }
                 #warn "  mapping: $from_row => $to_row\n";
@@ -898,7 +910,7 @@ sub calc_capture_mapping ($$) {
                 $assigned{$to_row} = 1;
             }
         } continue {
-            $to_row++;
+            $to_row_cnt++;
         }
         $from_row++;
     }
@@ -1235,9 +1247,15 @@ sub resolve_dfa_edge ($$$$$$$$) {
     }
 
     my @states;
-    for my $nfa_edge (@$nfa_edges) {
-        my $state = $nfa_edge->[-1];
-        push @states, $state;
+    {
+        my %seen;
+        for my $nfa_edge (@$nfa_edges) {
+            my $state = $nfa_edge->[-1];
+            if (!exists $seen{$state}) {
+                $seen{$state} = 1;
+                push @states, $state;
+            }
+        }
     }
 
     if (@actions) {
@@ -1516,10 +1534,41 @@ sub reorder_nfa_edges ($$) {
 
 sub dedup_nfa_edges ($) {
     my ($nfa_edges) = @_;
+    #return $nfa_edges;
     my %visited;
     my @ret;
     for my $e (@$nfa_edges) {
         my $last = $e->[-1];
+        my $counting = $counter_sets{$last};
+        if (defined $counting) {
+            my ($addcnt, $inccnt);
+            for my $pc (@$e) {
+                my $bc = $bytecodes[$pc];
+                if (ref $bc) {
+                    my $op = $bc->[0];
+                    if ($op eq 'addcnt') {
+                        $addcnt = $bc->[1];
+                    } elsif ($op eq 'inccnt') {
+                        $inccnt = $bc->[1];
+                    }
+                }
+            }
+            my $key;
+            if (defined $addcnt) {
+                $key = "addcnt-$addcnt";
+            } elsif (defined $inccnt) { # contains inccnt only (without addcnt)
+                $key = "inccnt-$inccnt";
+            } else {
+                die "an NFA edge to a counting NFA state cannot have neither addcnt nor inccnt.";
+            }
+            if ($visited{$key}) {
+                next;
+            }
+            $visited{$key} = 1;
+            push @ret, $e;
+            next;
+        }
+
         if ($visited{$last}) {
             next;
         }
@@ -1985,14 +2034,17 @@ _EOC_
     for my $id (sort keys %counter_sets) {
         my $count = $counter_sets{$id};
         my $ncounters = $count;
+        # we need one more element because capturing code runs before counter handling
+        # code and the former may add a new counter exceeding the limit.
+        my $ncnt_ovecs = $count + 1;
         $src .= <<_EOC_;
 
-    short       counter_set_$id\[$ncounters];
-    short      *oldest_counter_for_$id = counter_set_$id;
-    short      *next_counter_for_$id = counter_set_$id;
-    int         counter_ovec_set_$id\[$ncounters][$nvec];
-    int       (*oldest_counter_ovec_for_$id)[$nvec] = counter_ovec_set_$id;
-    int       (*next_counter_ovec_for_$id)[$nvec] = counter_ovec_set_$id;
+    static short       counter_set_$id\[$ncounters];
+    short             *oldest_counter_for_$id = counter_set_$id;
+    short             *next_counter_for_$id = counter_set_$id;
+    static int         counter_ovec_set_$id\[$ncnt_ovecs][$nvec];
+    int              (*oldest_counter_ovec_for_$id)[$nvec] = counter_ovec_set_$id;
+    int              (*next_counter_ovec_for_$id)[$nvec] = counter_ovec_set_$id;
 _EOC_
     }
 
@@ -2025,7 +2077,7 @@ sub gen_c_from_dfa_node ($$) {
 
     my $edges = $node->{edges};
 
-    $src .= qq{    fprintf(stderr, "* entering state $label\\n");\n} if $debug;
+    $src .= qq{    fprintf(stderr, "* entering state $label (i=%d len=%d)\\n", i, (int) len);\n} if $debug;
 
     my $used_error;
 
@@ -2230,10 +2282,6 @@ _EOC_
     if ($gen_read_char && @$edges) {
         if ($edges->[0]{to_accept}) {
             $src .= "    c = i < len ? s[i++] : (i++, -1);\n";
-            if ($debug) {
-                $src .= qq{    fprintf(stderr, "reading new char \\"%d\\"\\n", c);\n};
-            }
-
             $to_accept = 1;
 
         } else {
@@ -2246,10 +2294,10 @@ _EOC_
     c = s[i++];
 _EOC_
             $used_error = 1;
+        }
 
-            if ($debug) {
-                $src .= qq{    fprintf(stderr, "reading new char \\"%d\\"\\n", c);\n};
-            }
+        if ($debug) {
+            $src .= qq{    fprintf(stderr, "reading new char %d (offset %d)\\n", c, i - 1);\n};
         }
     }
 
@@ -2616,7 +2664,9 @@ sub gen_c_from_dfa_edge ($$$$$) {
         # normal DFA edge w/o assertions
 
         $src .= gen_capture_handler_c_code($edge, $to_accept, $indent, $nvec);
-        $src .= gen_edge_action_c_code($edge, $indent);
+        if (!$to_accept) {
+            $src .= gen_edge_action_c_code($edge, $indent);
+        }
 
         my $to = $target->{idx};
         if (!$to_accept && !$edge->{memchr}) {
@@ -2674,20 +2724,21 @@ sub gen_capture_handler_c_code ($$$$) {
             }
         }
 
-        my $cntset;
+        my $to_cntset;
         {
             my $counting = $counter_sets{$to_pc};
             if (defined $counting) {
-                $cntset = $to_pc;
-                $new_cnt_ovec{$cntset} = 1;
+                $to_cntset = $to_pc;
+                $new_cnt_ovec{$to_cntset} = 1;
             }
         }
 
-        if (!$to_accept && ($from_row != $to_row || defined $cntset)) {
+        my $from_cntset = $counter_sets{$from_pc};
+        if (!$to_accept && ($from_row != $to_row || defined $to_cntset || defined $from_cntset)) {
             if ($overwritten{$from_row}) {
                 $to_save_rows{$from_row} = 1;
             }
-            if (!$to_be_stored{$to_row}) {
+            if (!$to_be_stored{$to_row} && !defined $to_cntset) {
                 $overwritten{$to_row} = 1;
             }
         }
@@ -2714,11 +2765,11 @@ sub gen_capture_handler_c_code ($$$$) {
             for (my $i = 0; $i < $nvec; $i++) {
                 if (!$to_be_stored{"$to_row-$i"}) {
                     my $to_var = gen_dst_cap_var($to_row, $i, $to_pc);
-                    if ($to_save_rows{$to_row} && !defined $to_cntset) {
+                    if ($to_save_rows{$to_row}) {
                         $t .= $indent . "tmp${to_row}_$i = $to_var;\n";
                     }
                     my $from_var;
-                    if ($overwritten{$from_row} && !$to_be_stored{"$from_row-$i"} && !defined $from_cntset) {
+                    if ($overwritten{$from_row} && !$to_be_stored{"$from_row-$i"}) {
                         # TODO: we could reuse the capsROW_COL variales here for temps
                         # if the source is a counter set ovector.
                         $from_var = "tmp${from_row}_$i";
@@ -2728,7 +2779,9 @@ sub gen_capture_handler_c_code ($$$$) {
                     $t .= $indent . "$to_var = $from_var;\n";
                 }
             }
-            $overwritten{$to_row} = 1;
+            if (!defined $to_cntset) {
+                $overwritten{$to_row} = 1;
+            }
             push @transfers, $t;
         }
     }
@@ -2743,7 +2796,7 @@ ${indent}    size = next_counter_ovec_for_$cntset - oldest_counter_ovec_for_$cnt
 ${indent}    oldest_counter_ovec_for_$cntset = memmove(counter_ovec_set_$cntset,
 ${indent}                                        oldest_counter_ovec_for_$cntset,
 ${indent}                                        size * sizeof(counter_ovec_set_$cntset\[0]));
-${indent}    next_counter_ovec_for_$cntset -= size;
+${indent}    next_counter_ovec_for_$cntset = counter_ovec_set_$cntset + size;
 _EOC_
 
             if ($debug) {
@@ -2754,6 +2807,10 @@ _EOC_
 ${indent}}
 ${indent}next_counter_ovec_for_$cntset++;
 _EOC_
+
+            if ($debug) {
+                $src .= qq{${indent}fprintf(stderr, "add new counter ovec for set $cntset.\\n");\n};
+            }
         }
     }
 
@@ -2920,6 +2977,7 @@ sub analyze_dfa ($) {
                     if (!defined $target_countings || !$target_countings->{$nfa_state}) {
                         #warn "Found clearing edge from $node->{idx} to $target->{idx} ",
                         #"for counter set $nfa_state\n";
+                        #warn "add clrcnt action to DFA edge $node->{idx} => $target->{idx}: ";
                         my $actions = $dfa_edge->{actions};
                         if (!defined $actions) {
                             $actions = [["clrcnt", $nfa_state]];
@@ -3137,9 +3195,10 @@ sub rewrite_repetitions ($) {
                 # directly fill the gap instead of appending to the bytecode
                 # program if the gap is big enough.
                 my $use_gap;
-                if ($count >= 7) {
+                if ($count >= 8) {
                     $use_gap = 1;
                 }
+                $count--;
                 my $end = $use_gap ? $start_pc + 1 : @$bytecodes;
                 my $counter_id = $end + 1;
                 $counter_sets{$counter_id} = $count;
@@ -3157,6 +3216,7 @@ sub rewrite_repetitions ($) {
                 $bytecodes->[$pc++] = ["assert", "cnt", $counter_id, "n ne", $count];
                 $bytecodes->[$pc++] = ["jmp", $counter_id - 1];
                 $bytecodes->[$pc++] = ["assert", "cnt", $counter_id, "n eq", $count];
+                $bytecodes->[$pc++] = $bc;
                 #$bytecodes->[$pc++] = ["delcnt", $counter_id];
                 if (!$use_gap) {
                     $bytecodes->[$pc++] = ["jmp", $saved_pc];
@@ -3220,13 +3280,14 @@ sub gen_edge_action_c_code ($$) {
         # TODO: skip this operation if clrcnt is present.
         # TODO: remove the following branch test if possible
         $src .= <<_EOC_;
-${indent}if (*oldest_counter_for_$set_id == $count) {
+${indent}if (next_counter_for_$set_id != counter_set_$set_id && *oldest_counter_for_$set_id == $count) {
 ${indent}    oldest_counter_for_$set_id++;
 ${indent}    oldest_counter_ovec_for_$set_id++;
 _EOC_
 
         if ($debug) {
             $src .= <<_EOC_;
+${indent}    fprintf(stderr, "action: del oldest counter ovector from set $set_id.\\n");
 ${indent}    fprintf(stderr, "action: delcnt $set_id (olest counter: %d, %d counters).\\n",
 ${indent}            (int) *oldest_counter_for_$set_id,
 ${indent}            (int) (next_counter_for_$set_id - oldest_counter_for_$set_id));
@@ -3249,7 +3310,7 @@ ${indent}    size = next_counter_for_$set_id - oldest_counter_for_$set_id;
 ${indent}    oldest_counter_for_$set_id = memmove(counter_set_$set_id,
 ${indent}                                         oldest_counter_for_$set_id,
 ${indent}                                         size * sizeof(counter_set_$set_id\[0]));
-${indent}    next_counter_for_$set_id -= size;
+${indent}    next_counter_for_$set_id = counter_set_$set_id + size;
 _EOC_
 
             if ($debug) {
