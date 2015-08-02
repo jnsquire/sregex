@@ -109,6 +109,8 @@ sub gen_capture_handler_c_code ($$$$);
 sub gen_edge_action_c_code ($$);
 sub gen_c_from_dfa_edge ($$$$$);
 sub gen_c_from_dfa_node ($$);
+sub gen_src_cap_var ($$$);
+sub gen_dst_cap_var ($$$);
 sub dump_code ($);
 sub count_chars_and_holes_in_ranges ($);
 sub analyze_dfa ($);
@@ -227,10 +229,12 @@ while (<$in>) {
 
 close $in;
 
-my $n = rewrite_repetitions(\@bytecodes);
-if ($n > 0 && $debug) {
-    print "Rewrote $n repetitions. New bytecode dump:\n";
-    print dump_bytecode(\@bytecodes);
+if (1) {
+    my $n = rewrite_repetitions(\@bytecodes);
+    if ($n > 0 && $debug) {
+        print "Rewrote $n repetitions. New bytecode dump:\n";
+        print dump_bytecode(\@bytecodes);
+    }
 }
 
 #warn Dumper \@bytecodes;
@@ -873,13 +877,27 @@ sub calc_capture_mapping ($$) {
     for my $src_state (@$src_states) {
         my $to_row = 0;
         for my $nfa_edge (@$nfa_edges) {
-            my $to_pc = $nfa_edge->[0];
+            my $to_pc = $nfa_edge->[0]; # first NFA node in the NFA edge, not the last one
             my $key = "$src_state-$to_pc";
             if (!$assigned{$to_row} && $nfa_paths{$key}) {
+                my $src_counting = $counter_sets{$src_state};
+                if (defined $src_counting) {
+                    my $dst_counting = $counter_sets{$nfa_edge->[-1]}; # here we must use the last one
+                    if (defined $dst_counting && $dst_counting == $src_counting) {
+                        # skip mapping counter state to the same counter state
+                        # since the mapping is implicit by keeping the same
+                        # counter_ovec_set_xxx row through such transitions.
+                        # more importantly, we prevent this useless edge from
+                        # hiding subsequent edges with "addcnt" actions which
+                        # does real jobs.
+                        next;
+                    }
+                }
                 #warn "  mapping: $from_row => $to_row\n";
-                push @mappings, [$from_row, $to_row];
+                push @mappings, [$from_row, $to_row, $src_state, $nfa_edge->[-1]];
                 $assigned{$to_row} = 1;
             }
+        } continue {
             $to_row++;
         }
         $from_row++;
@@ -1926,6 +1944,8 @@ main(void)
         printf("\\n");
     }
 
+    free(buf);
+
     return 0;
 }
 
@@ -1970,6 +1990,9 @@ _EOC_
     short       counter_set_$id\[$ncounters];
     short      *oldest_counter_for_$id = counter_set_$id;
     short      *next_counter_for_$id = counter_set_$id;
+    int         counter_ovec_set_$id\[$ncounters][$nvec];
+    int       (*oldest_counter_ovec_for_$id)[$nvec] = counter_ovec_set_$id;
+    int       (*next_counter_ovec_for_$id)[$nvec] = counter_ovec_set_$id;
 _EOC_
     }
 
@@ -2272,23 +2295,23 @@ closing_state:
     }
 
     my $indent = '';
-    if (!$seen_accept) {
-        $src .= "    if (matched_0 != -1) {\n";
-        $indent = '    ';
-    }
+    $src .= "    if (matched_0 != -1) {\n";
+    $indent = '    ';
 
     for (my $i = 0; $i < $nvec; $i++) {
-        $src .= $indent . "    ovec[$i] = matched_$i;\n";
+        my $assign = "    ovec[$i] = matched_$i;";
+        $src .= $indent . "$assign\n";
+        if ($debug > 1) {
+            $src .= $indent . qq{    fprintf(stderr, "$assign\\n");\n};
+        }
     }
 
     $src .= $indent . "    return MATCHED;  /* fallback */\n";
 
-    if (!$seen_accept) {
-        $src .= <<'_EOC_';
+    $src .= <<'_EOC_';
     }
     return NO_MATCH;
 _EOC_
-    }
 
     return $src;
 }
@@ -2395,7 +2418,11 @@ sub gen_c_from_dfa_edge ($$$$$) {
             $src .= $indent . "if (asserts == $sibling_assert_settings) {\n";
 
             for (my $i = 0; $i < $nvec; $i++) {
-                $src .= $indent . "    ovec[$i] = matched_$i;\n";
+                my $assign = "    ovec[$i] = matched_$i;";
+                $src .= $indent . "$assign\n";
+                if ($debug > 1) {
+                    $src .= $indent . qq{    fprintf(stderr, "$assign\\n");\n};
+                }
             }
 
             $src .= $indent . "    return MATCHED;\n";
@@ -2572,11 +2599,12 @@ sub gen_c_from_dfa_edge ($$$$$) {
             if ($target->{accept}) {
                 $to_accept = 1;
             }
+            $src .= gen_capture_handler_c_code($subedge, $target->{accept}, $indent2, $nvec);
             if (!$to_accept) {
                 # we don't care about cleanup for to-accept states.
                 $src .= gen_edge_action_c_code($subedge, $indent2);
             }
-            $src .= gen_capture_handler_c_code($subedge, $target->{accept}, $indent2, $nvec);
+
             my $to = $target->{idx};
             if (!$to_accept) {
                 $src .= $indent2 . "goto st$to;\n";
@@ -2587,8 +2615,8 @@ sub gen_c_from_dfa_edge ($$$$$) {
     } else {
         # normal DFA edge w/o assertions
 
-        $src .= gen_edge_action_c_code($edge, $indent);
         $src .= gen_capture_handler_c_code($edge, $to_accept, $indent, $nvec);
+        $src .= gen_edge_action_c_code($edge, $indent);
 
         my $to = $target->{idx};
         if (!$to_accept && !$edge->{memchr}) {
@@ -2625,9 +2653,9 @@ sub gen_capture_handler_c_code ($$$$) {
     my $mappings = $edge->{capture_mappings};
     my $nfa_edges = $edge->{nfa_edges};
 
-    my (%to_save_rows, %overwritten, @stores, %to_be_stored);
+    my (%to_save_rows, %overwritten, @stores, %to_be_stored, %new_cnt_ovec);
     for my $mapping (@$mappings) {
-        my ($from_row, $to_row) = @$mapping;
+        my ($from_row, $to_row, $from_pc, $to_pc) = @$mapping;
 
         my $nfa_edge = $nfa_edges->[$to_row];
         for my $pc (@$nfa_edge) {
@@ -2638,15 +2666,24 @@ sub gen_capture_handler_c_code ($$$$) {
                 if ($to_accept) {
                     push @stores, "matched_$id = i - 1;";
                 } else {
-                    push @stores, "caps${to_row}_$id = i - 1;";
+                    my $to_var = gen_dst_cap_var($to_row, $id, $to_pc);
+                    push @stores, "$to_var = i - 1;";
+                    # TODO: skip newly initialized ovector in counter set states.
                     $to_be_stored{"$to_row-$id"} = 1;
                 }
-            } elsif ($bcname eq 'assert') {
-                #warn "TODO: assertions";
             }
         }
 
-        if (!$to_accept && $from_row != $to_row) {
+        my $cntset;
+        {
+            my $counting = $counter_sets{$to_pc};
+            if (defined $counting) {
+                $cntset = $to_pc;
+                $new_cnt_ovec{$cntset} = 1;
+            }
+        }
+
+        if (!$to_accept && ($from_row != $to_row || defined $cntset)) {
             if ($overwritten{$from_row}) {
                 $to_save_rows{$from_row} = 1;
             }
@@ -2660,28 +2697,33 @@ sub gen_capture_handler_c_code ($$$$) {
 
     my @transfers;
     for my $mapping (@$mappings) {
-        my ($from_row, $to_row) = @$mapping;
+        my ($from_row, $to_row, $from_pc, $to_pc) = @$mapping;
+        my $to_cntset = $counter_sets{$to_pc};
+        my $from_cntset = $counter_sets{$from_pc};
 
         if ($to_accept) {
-            my $t = $indent . "/* transfer caps from row $from_row to matched */\n";
+            my $t = $indent . "/* transfer caps from row $from_row ($from_pc) to matched */\n";
             for (my $i = 0; $i < $nvec; $i++) {
-                $t .= $indent . "matched_$i = caps${from_row}_$i;\n";
+                my $from_var = gen_src_cap_var($from_row, $i, $from_pc);
+                $t .= $indent . "matched_$i = $from_var;\n";
             }
             push @transfers, $t;
 
-        } elsif ($from_row != $to_row) {
-            my $t = $indent . "/* transfer caps from row $from_row to row $to_row */\n";
+        } elsif ($from_row != $to_row || defined $to_cntset || defined $from_cntset) {
+            my $t = $indent . "/* transfer caps from row $from_row ($from_pc) to row $to_row ($to_pc) */\n";
             for (my $i = 0; $i < $nvec; $i++) {
                 if (!$to_be_stored{"$to_row-$i"}) {
-                    my $to_var = "caps${to_row}_$i";
-                    if ($to_save_rows{$to_row}) {
+                    my $to_var = gen_dst_cap_var($to_row, $i, $to_pc);
+                    if ($to_save_rows{$to_row} && !defined $to_cntset) {
                         $t .= $indent . "tmp${to_row}_$i = $to_var;\n";
                     }
                     my $from_var;
-                    if ($overwritten{$from_row} && !$to_be_stored{"$from_row-$i"}) {
+                    if ($overwritten{$from_row} && !$to_be_stored{"$from_row-$i"} && !defined $from_cntset) {
+                        # TODO: we could reuse the capsROW_COL variales here for temps
+                        # if the source is a counter set ovector.
                         $from_var = "tmp${from_row}_$i";
                     } else {
-                        $from_var = "caps${from_row}_$i";
+                        $from_var = gen_src_cap_var($from_row, $i, $from_pc);
                     }
                     $t .= $indent . "$to_var = $from_var;\n";
                 }
@@ -2689,7 +2731,30 @@ sub gen_capture_handler_c_code ($$$$) {
             $overwritten{$to_row} = 1;
             push @transfers, $t;
         }
+    }
 
+    if (%new_cnt_ovec) {
+        for my $cntset (sort keys %new_cnt_ovec) {
+            $src .= <<_EOC_;
+${indent}/* add a new ovector to the counter set $cntset */
+${indent}if (unlikely(next_counter_ovec_for_$cntset - counter_ovec_set_$cntset >= nelems(counter_ovec_set_$cntset))) {
+${indent}    size_t     size;
+${indent}    size = next_counter_ovec_for_$cntset - oldest_counter_ovec_for_$cntset;
+${indent}    oldest_counter_ovec_for_$cntset = memmove(counter_ovec_set_$cntset,
+${indent}                                        oldest_counter_ovec_for_$cntset,
+${indent}                                        size * sizeof(counter_ovec_set_$cntset\[0]));
+${indent}    next_counter_ovec_for_$cntset -= size;
+_EOC_
+
+            if ($debug) {
+                $src .= qq{${indent}fprintf(stderr, "re-organize counter ovec set $cntset.\\n");\n};
+            }
+
+            $src .= <<_EOC_;
+${indent}}
+${indent}next_counter_ovec_for_$cntset++;
+_EOC_
+        }
     }
 
     if (@transfers) {
@@ -2706,6 +2771,12 @@ sub gen_capture_handler_c_code ($$$$) {
             $src .= $indent . "int " .  join(", ", @tmp) . ";\n";
         }
         $src .= join "", @transfers;
+        if ($debug > 1) {
+            $src .= join "", map { (my $s = $_) =~ s/"/\\"/g;
+                                   $s =~ s/\n/\\n/g;
+                                   qq/${indent}fprintf(stderr, "$s\\n");\n/;
+                                 } @transfers;
+        }
         if (%to_save_rows) {
             $src .= $indent . "}\n";
         }
@@ -2713,9 +2784,40 @@ sub gen_capture_handler_c_code ($$$$) {
 
     if (@stores) {
         $src .= $indent . join("\n$indent", @stores) . "\n";
+        if ($debug > 1) {
+            $src .= $indent . join "\n$indent",
+                                    map { (my $s = $_) =~ s/"/\\"/g;
+                                          $s =~ s/\n/\\n/g;
+                                          qq/fprintf(stderr, "$indent$s\\n");\n/;
+                                        } @stores;
+        }
     }
 
     return $src;
+}
+
+sub gen_src_cap_var ($$$) {
+    my ($row, $col, $pc) = @_;
+    my $var;
+    my $counting = $counter_sets{$pc};  # fetch counter set ID (if any)
+    if (defined $counting) {
+        $var = "oldest_counter_ovec_for_$pc\[0][$col]";
+    } else {
+        $var = "caps${row}_$col";
+    }
+    return $var;
+}
+
+sub gen_dst_cap_var ($$$) {
+    my ($row, $col, $pc) = @_;
+    my $var;
+    my $counting = $counter_sets{$pc};  # fetch counter set ID (if any)
+    if (defined $counting) {
+        $var = "next_counter_ovec_for_$pc\[-1][$col]";
+    } else {
+        $var = "caps${row}_$col";
+    }
+    return $var;
 }
 
 sub usage ($) {
@@ -3051,7 +3153,7 @@ sub rewrite_repetitions ($) {
                 my $pc = $end;
                 $bytecodes->[$pc++] = ["inccnt", $counter_id];
                 $bytecodes->[$pc++] = $bc;
-                $bytecodes->[$pc++] = ["split", $pc + 1, $pc + 3];
+                $bytecodes->[$pc++] = ["split", $pc + 3, $pc + 1];
                 $bytecodes->[$pc++] = ["assert", "cnt", $counter_id, "n ne", $count];
                 $bytecodes->[$pc++] = ["jmp", $counter_id - 1];
                 $bytecodes->[$pc++] = ["assert", "cnt", $counter_id, "n eq", $count];
@@ -3120,6 +3222,7 @@ sub gen_edge_action_c_code ($$) {
         $src .= <<_EOC_;
 ${indent}if (*oldest_counter_for_$set_id == $count) {
 ${indent}    oldest_counter_for_$set_id++;
+${indent}    oldest_counter_ovec_for_$set_id++;
 _EOC_
 
         if ($debug) {
@@ -3144,7 +3247,8 @@ ${indent}if (unlikely(next_counter_for_$set_id - counter_set_$set_id >= nelems(c
 ${indent}    size_t     size;
 ${indent}    size = next_counter_for_$set_id - oldest_counter_for_$set_id;
 ${indent}    oldest_counter_for_$set_id = memmove(counter_set_$set_id,
-${indent}                                         oldest_counter_for_$set_id, size);
+${indent}                                         oldest_counter_for_$set_id,
+${indent}                                         size * sizeof(counter_set_$set_id\[0]));
 ${indent}    next_counter_for_$set_id -= size;
 _EOC_
 
@@ -3169,7 +3273,10 @@ _EOC_
             #$src .= "${indent}oldest_counter_for_$set_id++;\n";
         } else {
             die "unknown action: @$action" if $op ne 'clrcnt';
-            $src .= "${indent}next_counter_for_$set_id = oldest_counter_for_$set_id = counter_set_$set_id;\n";
+            $src .= <<_EOC_;
+${indent}next_counter_for_$set_id = oldest_counter_for_$set_id = counter_set_$set_id;
+${indent}next_counter_ovec_for_$set_id = oldest_counter_ovec_for_$set_id = counter_ovec_set_$set_id;
+_EOC_
         }
         if ($debug) {
             $src .= <<_EOC_;
