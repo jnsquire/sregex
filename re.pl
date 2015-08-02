@@ -493,7 +493,10 @@ sub add_nfa_edges ($$$$) {
         my $x = $bc->[1];
         my $y = $bc->[2];
         my $forked = $to_nodes ? [@$to_nodes] : undef;
-        add_nfa_edges($from_node, $x, $visited, $to_nodes);
+        # we must fork the visited hash table to allow parallel edges with different assertions.
+        my %visited_fork = %$visited;
+        add_nfa_edges($from_node, $x, \%visited_fork, $to_nodes);
+        #add_nfa_edges($from_node, $x, $visited, $to_nodes);
         local @_ = ($from_node, $y, $visited, $forked);
         goto \&add_nfa_edges;
     }

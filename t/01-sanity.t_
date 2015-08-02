@@ -1555,3 +1555,16 @@ re1 and re2 are wrong here.
 --- temp_cap chop
 [(0, -1)] [(0, -1)] [(0, -1)](1, 3) [(0, -1)](1, 3)
 
+
+
+=== TEST 251: parallel 0-width assertions (1)
+--- re eval: ' (?:(\b)|($))'
+--- s eval: " a"
+--- cap: (0, 1) (1, 1)
+
+
+
+=== TEST 252: parallel 0-width assertions (2)
+--- re eval: ' (?:(\b)|($))'
+--- s eval: " \n"
+--- cap: (0, 1) (-1, -1) (1, 1)
