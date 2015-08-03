@@ -116,6 +116,7 @@ sub dump_code ($);
 sub count_chars_and_holes_in_ranges ($);
 sub analyze_dfa ($);
 sub dump_bytecode ($);
+sub pc2bc ($);
 
 my $cc = "cc";
 my $debug = 0;
@@ -195,6 +196,7 @@ if (!$res) {
 warn "$res" if $debug;
 open my $in, "<", \$res or die $!;
 
+my %counting_state_twins;
 my (@bytecodes, $found);
 while (<$in>) {
     if (!$found) {
@@ -466,11 +468,42 @@ sub gen_nfa () {
         $idx++;
     }
 
+    my @ext_nodes;
     for my $node (@nodes) {
         my %visited;
         my $idx = $node->{idx};
         next if $node->{accept};
         add_nfa_edges($node, $idx == 0 ? 0 : $idx + 1, \%visited, undef);
+
+        if (defined $counter_sets{$idx}) {
+            # create a mirror for counting NFA states with a reversed NFA
+            # edge order.
+            # Note: here we assume there's no extra NFA edges looping
+            # through the counting NFA state itself. this is currently
+            # guarenteed by an artificial sentinel NFA node right after
+            # the counting state.
+            my @edges = @{ $node->{edges} };
+            #warn "counting node edges: ", Dumper(\@edges);
+            die if @edges != 2;
+            my $last_edge = [ @{ $edges[-1] } ];
+            my $bc = pc2bc($last_edge->[0]);
+            #warn Dumper($bc);
+            die if $last_edge->[-1] != $idx || !ref $bc || $bc->[0] ne 'assert' || $bc->[2] != $idx;
+            $last_edge->[-1] = -$idx;
+            $edges[-1] = $last_edge;
+            @edges = reverse @edges;
+            my $twin_node = {
+                idx => -$idx,
+                edges => \@edges,
+            };
+            #warn "counting node edges 2: ", Dumper($twin_node->{edges});
+            push @ext_nodes, $twin_node;
+            $node->{twin} = $twin_node;
+        }
+    }
+
+    if (@ext_nodes) {
+        push @nodes, @ext_nodes;
     }
 
     return {
@@ -504,6 +537,7 @@ sub draw_nfa ($) {
     #$graph->as_dot("nfa.dot");
     for my $node (@$nfa_nodes) {
         my $idx = $node->{idx};
+        #next if $idx < 0;
         my $style;
         if (defined $counter_sets{$idx}) {
             $style = "filled,dashed";
@@ -515,6 +549,10 @@ sub draw_nfa ($) {
     }
     for my $node (@$nfa_nodes) {
         my $from_idx = $node->{idx};
+        #next if $from_idx < 0;
+        #if ($from_idx == 15) {
+            #warn "Draw NFA eges for NFA node $from_idx: ", Dumper($node->{edges});
+            #}
         my $e_idx = 0;
         for my $e (@{ $node->{edges} }) {
             my ($label, $style) = gen_nfa_edge_label($e);
@@ -533,14 +571,14 @@ sub add_nfa_edges ($$$$) {
     my ($from_node, $idx, $visited, $to_nodes) = @_;
 
     #warn "add edges: $from_node->{idx} => $idx";
-    my $bc = $bytecodes[$idx];
+    my $bc = pc2bc($idx);
     return unless defined $bc;
 
     my $opcode = opcode($bc);
 
     if ($opcode eq 'nop') {
         for ($idx++; $idx < @bytecodes; $idx++) {
-            $bc = $bytecodes[$idx];
+            $bc = pc2bc($idx);
             if (!ref $bc && $bc eq 'nop') {
                 next;
             }
@@ -628,7 +666,7 @@ sub gen_nfa_edge_label ($) {
     my @styles;
     my @labels;
     for my $idx (@$e) {
-        my $bc = $bytecodes[$idx];
+        my $bc = pc2bc($idx);
         my $opcode = opcode($bc);
         #warn "opcode: $opcode\n";
         my $info = $cached_labels{$bc};
@@ -680,7 +718,7 @@ sub gen_nfa_edge_label ($) {
             } elsif ($opcode eq 'inccnt') {
                 $label ="cnt++";
             } else {
-                die "unknown opcode: $opcode";
+                croak "unknown opcode: $opcode";
             }
 
             $cached_labels{$bc} = [$label, $consuming, $style];
@@ -785,7 +823,7 @@ sub gen_dfa ($) {
 
             my @all_nfa_edges;
             for my $nfa_node (@$nfa_nodes) {
-                my $idx = $nfa_node->{idx};
+                #my $idx = $nfa_node->{idx};
                 my $edges = $nfa_node->{edges};
                 if ($edges) {
                     push @all_nfa_edges, @$edges;
@@ -893,12 +931,13 @@ sub calc_capture_mapping ($$) {
     #warn "src $from_node->{idx} {", join(",", @$src_states),
         #"} => dst $dfa_edge->{target}{idx} ",
     #gen_dfa_node_label($dfa_edge->{target}), "\n";
-    for my $src_state (@$src_states) {
+    for my $raw_src_state (@$src_states) {
+        my $src_state = abs $raw_src_state;
         my $to_row_cnt = 0;
         my %seen_dst_state;
         for my $nfa_edge (@$nfa_edges) {
-            my $to_pc = $nfa_edge->[0]; # first NFA node in the NFA edge, not the last one
-            my $dst_state = $nfa_edge->[-1];
+            my $to_pc = abs $nfa_edge->[0]; # first NFA node in the NFA edge, not the last one
+            my $dst_state = abs $nfa_edge->[-1];
             my $to_row = $seen_dst_state{$dst_state};
             if (!defined $to_row) {
                 $seen_dst_state{$dst_state} = 1;
@@ -925,7 +964,7 @@ sub calc_capture_mapping ($$) {
                     }
                 }
                 #warn "  mapping: $from_row => $to_row\n";
-                push @mappings, [$from_row, $to_row, $src_state, $nfa_edge->[-1]];
+                push @mappings, [$from_row, $to_row, $src_state, $dst_state];
                 $assigned{$to_row} = 1;
             }
         } continue {
@@ -983,7 +1022,7 @@ sub gen_dfa_edges_for_asserts ($$$$$$) {
 
     my %targets;
     for my $dfa_edge (@dfa_edges) {
-        $dfa_edge = resolve_dfa_edge(undef, $dfa_edge, undef, \%targets,
+        $dfa_edge = resolve_dfa_edge($from_node, $dfa_edge, undef, \%targets,
                                      $dfa_nodes, $dfa_node_hash, $idx_ref, 1);
     }
 
@@ -1013,7 +1052,7 @@ sub gen_dfa_edges ($$$$$$) {
         }
 
         my $to = $nfa_edge->[-1];
-        my $bc = $bytecodes[$to];
+        my $bc = pc2bc($to);
         my $opcode = opcode($bc);
         #warn "opcode: $opcode";
         if ($opcode eq 'any') {
@@ -1244,12 +1283,12 @@ sub resolve_dfa_edge ($$$$$$$$) {
         for my $nfa_edge (@$nfa_edges) {
             if (!defined $assert_info) {
                 for my $pc (@$nfa_edge) {
-                    my $bc = $bytecodes[$pc];
+                    my $bc = pc2bc($pc);
                     if (ref $bc && $bc->[0] =~ /cnt/) {
                         #warn "HIT $bc->[0]";
-                        if (!$seen{$pc}) {
-                            push @actions, $bytecodes[$pc];
-                            $seen{$pc} = 1;
+                        if (!$seen{abs $pc}) {
+                            push @actions, $bc;
+                            $seen{abs $pc} = 1;
                         }
                     }
                 }
@@ -1263,6 +1302,64 @@ sub resolve_dfa_edge ($$$$$$$$) {
     if (!defined $assert_info) {
         $nfa_edges = dedup_nfa_edges($nfa_edges);
         $dfa_edge->{nfa_edges} = $nfa_edges;
+    }
+
+    {
+        my (%seen_counting_states, @new_nfa_edges, $found);
+        for my $nfa_edge (@$nfa_edges) {
+            my $last = $nfa_edge->[-1];
+            my $new_last;
+            if ($counter_sets{$last}) {  # found a counting NFA state
+                $new_last = $seen_counting_states{abs $last};
+                if (!defined $new_last) {
+                    my $first = $nfa_edge->[0];
+                    my $bc = pc2bc($first);
+                    if (ref $bc && $bc->[0] eq 'assert' && $bc->[-2] eq 'n ne') {
+                        # inccnt first
+                        if ($from_node->{idx} == 11) {
+                            #warn "inccnt: $from_node->{idx} -> $$idx_ref: $last";
+                        }
+                        if ($last < 0) {
+                            $new_last = -$last;
+                        }
+
+                    } else {
+                        # addcnt first
+                        if ($from_node->{idx} == 11) {
+                            #warn "addcnt: $from_node->{idx} -> $$idx_ref: $last";
+                        }
+                        # so...we do nothing
+                        if ($last > 0) {
+                            $new_last = -$last;
+                        }
+                    }
+                    $seen_counting_states{abs $last} = $new_last // $last;
+                }
+            }
+            my $new_nfa_edge;
+            if (defined $new_last && $new_last ne $last) {
+                $found = 1;
+                $new_nfa_edge = [@$nfa_edge];
+                $new_nfa_edge->[-1] = $new_last;
+            } else {
+                $new_nfa_edge = $nfa_edge;
+            }
+            push @new_nfa_edges, $new_nfa_edge;
+
+            if ($from_node->{idx} == 11) {
+                #warn "found hit (11 -> $$idx_ref): ", Dumper($new_nfa_edge);
+            }
+        }
+
+        if ($found) {
+            $nfa_edges = \@new_nfa_edges;
+            #warn "Found alternated NFA edge $from_node->{idx} -> $$idx_ref: ", Dumper($nfa_edges);
+            $dfa_edge->{nfa_edges} = $nfa_edges;
+        }
+
+        #if ($from_node->{idx} == 1 && $$idx_ref == 4) {
+            #warn "1 -> 4: ", Dumper($nfa_edges);
+            #}
     }
 
     my @states;
@@ -1300,6 +1397,13 @@ sub resolve_dfa_edge ($$$$$$$$) {
         #warn "looking up key $key";
         $target_dfa_node = $dfa_node_hash->{$key};
         if (defined $target_dfa_node) {
+            if ($target_dfa_node->{idx} == 2 && $from_node->{idx} == 4) {
+                #warn "DFA node 2 (from $from_node->{idx}): nfa nodes: ", Dumper($nfa_nodes);
+                #warn Dumper($from_node);
+                #warn "NFA edges from DFA node ", $from_node->{idx}, " to 2: ", Dumper($nfa_edges);
+                #warn "dfa edge: ", Dumper($dfa_edge);
+                #warn "===================";
+            }
             $dfa_edge->{target} = $target_dfa_node;
             return $dfa_edge;
         }
@@ -1310,7 +1414,7 @@ sub resolve_dfa_edge ($$$$$$$$) {
         my $count = $counter_sets{$state};
         if (defined $count) {
             #warn "Found counting state: $state ($count)\n";
-            $target_countings{$state} = $count;
+            $target_countings{abs $state} = $count;
         }
     }
 
@@ -1326,6 +1430,7 @@ sub resolve_dfa_edge ($$$$$$$$) {
         $nfa_nodes = [];
         for my $nfa_edge (@$nfa_edges) {
             my $nfa_idx = $nfa_edge->[-1];
+            #die $nfa_idx if $nfa_idx < 0;
             my $nfa_node = first { $_->{idx} eq $nfa_idx } @{ $nfa->{nodes} };
             push @$nfa_nodes, $nfa_node;
         }
@@ -1342,10 +1447,7 @@ sub resolve_dfa_edge ($$$$$$$$) {
         idx => $$idx_ref++,
         $is_accept ? (accept => 1) : (),
     };
-    #if ($target_dfa_node->{idx} == 319) {
-    #warn "from node: ", Dumper($from_node);
-    #die "dfa edge: ", Dumper($dfa_edge);
-    #}
+
     push @$dfa_nodes, $target_dfa_node;
     if (!defined $assert_info) {
         $dfa_node_hash->{$key} = $target_dfa_node;
@@ -1554,15 +1656,14 @@ sub reorder_nfa_edges ($$) {
 sub dedup_nfa_edges ($) {
     my ($nfa_edges) = @_;
     #return $nfa_edges;
-    my %visited;
-    my @ret;
+    my (%visited, @ret);
     for my $e (@$nfa_edges) {
-        my $last = $e->[-1];
+        my $last = abs $e->[-1];
         my $counting = $counter_sets{$last};
         if (defined $counting) {
             my ($addcnt, $inccnt);
             for my $pc (@$e) {
-                my $bc = $bytecodes[$pc];
+                my $bc = pc2bc($pc);
                 if (ref $bc) {
                     my $op = $bc->[0];
                     if ($op eq 'addcnt') {
@@ -1580,6 +1681,7 @@ sub dedup_nfa_edges ($) {
             } else {
                 die "an NFA edge to a counting NFA state cannot have neither addcnt nor inccnt.";
             }
+            #warn "dedup key: $key";
             if ($visited{$key}) {
                 next;
             }
@@ -1591,7 +1693,7 @@ sub dedup_nfa_edges ($) {
         if ($visited{$last}) {
             next;
         }
-        my $bc = $bytecodes[$last];
+        my $bc = pc2bc($last);
         #warn "opcode: ", opcode($bc);
         if (opcode($bc) eq 'match') {
             push @ret, $e;
@@ -2179,6 +2281,7 @@ _EOC_
 
     # emit counter sets
     for my $id (sort keys %counter_sets) {
+        next if $id < 0;
         my $count = $counter_sets{$id};
         my $ncounters = $count;
         # we need one more element because capturing code runs before counter handling
@@ -2877,7 +2980,7 @@ sub gen_capture_handler_c_code ($$$$) {
 
         my $nfa_edge = $nfa_edges->[$to_row];
         for my $pc (@$nfa_edge) {
-            my $bc = $bytecodes[$pc];
+            my $bc = pc2bc($pc);
             my $bcname = opcode($bc);
             if ($bcname eq 'save') {
                 my $id = $bc->[1];
@@ -2896,7 +2999,7 @@ sub gen_capture_handler_c_code ($$$$) {
         {
             my $counting = $counter_sets{$to_pc};
             if (defined $counting) {
-                $to_cntset = $to_pc;
+                $to_cntset = abs $to_pc;
                 $new_cnt_ovec{$to_cntset} = 1;
             }
         }
@@ -3026,6 +3129,7 @@ sub gen_src_cap_var ($$$) {
     my $var;
     my $counting = $counter_sets{$pc};  # fetch counter set ID (if any)
     if (defined $counting) {
+        $pc = abs $pc;
         $var = "oldest_counter_ovec_for_$pc\[0][$col]";
     } else {
         $var = "caps${row}_$col";
@@ -3038,6 +3142,7 @@ sub gen_dst_cap_var ($$$) {
     my $var;
     my $counting = $counter_sets{$pc};  # fetch counter set ID (if any)
     if (defined $counting) {
+        $pc = abs $pc;
         $var = "next_counter_ovec_for_$pc\[-1][$col]";
     } else {
         $var = "caps${row}_$col";
@@ -3140,7 +3245,7 @@ sub analyze_dfa ($) {
             for my $rec (@targets) {
                 my ($target, $dfa_edge) = @$rec;
                 my $target_countings = $target->{countings};
-                my $states = $target->{states};
+                #my $states = $target->{states};
                 for my $nfa_state (sort keys %$countings) {
                     if (!defined $target_countings || !$target_countings->{$nfa_state}) {
                         #warn "Found clearing edge from $node->{idx} to $target->{idx} ",
@@ -3148,7 +3253,7 @@ sub analyze_dfa ($) {
                         #warn "add clrcnt action to DFA edge $node->{idx} => $target->{idx}: ";
                         my $actions = $dfa_edge->{actions};
                         if (!defined $actions) {
-                            $actions = [["clrcnt", $nfa_state]];
+                            $actions = [["clrcnt", abs $nfa_state]];
                             $dfa_edge->{actions} = $actions;
                         } else {
                             #my $modified;
@@ -3159,7 +3264,7 @@ sub analyze_dfa ($) {
                                     #$modified = 1;
                                 #}
                             #}
-                            push @$actions, ["clrcnt", $nfa_state];
+                            push @$actions, ["clrcnt", abs $nfa_state];
                             #if ($modified) {
                                 #@$actions = grep { defined } @$actions;
                             #}
@@ -3370,6 +3475,7 @@ sub rewrite_repetitions ($) {
                 my $end = $use_gap ? $start_pc + 1 : @$bytecodes;
                 my $counter_id = $end + 1;
                 $counter_sets{$counter_id} = $count;
+                $counter_sets{-$counter_id} = $count;  # for the counterpart
                 $bytecodes->[$start_pc] = ["addcnt", $counter_id, $count];
                 $start_pc++;
                 if (!$use_gap) {
@@ -3380,6 +3486,9 @@ sub rewrite_repetitions ($) {
                 my $pc = $end;
                 $bytecodes->[$pc++] = ["inccnt", $counter_id];
                 $bytecodes->[$pc++] = $bc;
+                # the following NFA edge priority distinction is artifital and
+                # will be resolved later during DFA construction. see
+                # sub resolve_dfa_edge for details.
                 $bytecodes->[$pc++] = ["split", $pc + 3, $pc + 1];
                 $bytecodes->[$pc++] = ["assert", "cnt", $counter_id, "n ne", $count];
                 $bytecodes->[$pc++] = ["jmp", $counter_id - 1];
@@ -3532,4 +3641,12 @@ _EOC_
     }
 
     return $src;
+}
+
+sub pc2bc ($) {
+    my ($pc) = @_;
+    if ($pc < 0) {
+        return $bytecodes[-$pc];
+    }
+    return $bytecodes[$pc];
 }
