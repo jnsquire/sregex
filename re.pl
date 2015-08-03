@@ -32,7 +32,7 @@
 #   $ ./re.pl -o foo 'a|b' 'a'
 #
 #   # the following command generates some debug outputs
-#   # as well as PNG images ./nfa.png and ./dfa.png,
+#   # as well as PNG images ./nfa.png and ./dfa-partial.png,
 #   # for the NFA and DFA graphs, respectively.
 #   $ ./re.pl --debug=1 'ab|a' 'cab'
 #
@@ -93,6 +93,7 @@ sub gen_dfa ($);
 sub dedup_nfa_edges ($);
 sub reorder_nfa_edges ($$);
 sub draw_dfa ($);
+sub draw_partial_dfa ($$);
 sub escape_range ($$);
 sub gen_dfa_hash_key ($$);
 sub add_to_set ($$);
@@ -321,7 +322,7 @@ analyze_dfa($dfa);
 warn scalar @{ $dfa->{nodes} }, " DFA nodes found.\n" if $debug;
 
 #warn Dumper($dfa);
-draw_dfa($dfa) if $debug;
+draw_dfa($dfa) if $debug > 1;
 
 #exit;
 my $c = gen_c_from_dfa($dfa);
@@ -389,6 +390,24 @@ warn dump_code($c) if $debug == 2;
 
     if (!defined $out) {
         die "program crashed: $rc";
+    }
+
+    if ($debug && $err) {
+        my @route;
+        open my $in, "<", \$err or die $!;
+        while (<$in>) {
+            #warn "!! $_";
+            next if /^\s*$/;
+            if (/^\* entering (?:accept )?state \{[^}]+\} (\d+)/) {
+                my $state = $1;
+                push @route, $state;
+            } elsif (/^hit assertion DFA node (\d+)/) {
+                my $state = $1;
+                push @route, $state;
+            }
+        }
+        close $in;
+        draw_partial_dfa($dfa, \@route);
     }
 
     print $out;
@@ -1634,6 +1653,135 @@ sub add_to_hash ($$) {
     }
 }
 
+sub draw_partial_dfa ($$) {
+    my ($dfa, $route) = @_;
+
+    my (%visited_nodes, %visited_edges);
+    {
+        my $prev_node;
+        my $i = 0;
+        for my $node_idx (@$route) {
+            #warn "Found visited node idx $node_idx";
+            $visited_nodes{$node_idx} = 1;
+            if (!defined $prev_node) {
+                # first node
+            } else {
+                # got a new edge
+                my $key = "$prev_node-$node_idx";
+                my $values = $visited_edges{$key};
+                my $v = ++$i;
+                if (defined $values) {
+                    push @$values, $v;
+                } else {
+                    $values = [$v];
+                    $visited_edges{$key} = $values;
+                }
+            }
+        } continue {
+            $prev_node = $node_idx;
+        }
+    }
+
+    my $dfa_nodes = $dfa->{nodes};
+
+    undef $node_attr->{height};
+    undef $edge_attr->{arrowsize};
+
+    my $graph = GraphViz->new(
+        layout => 'neato',
+        ratio => 'auto',
+        node => $node_attr,
+        edge => $edge_attr,
+    );
+
+    my @nodes_to_draw;
+    {
+        my %seen;
+        for my $node (@$dfa_nodes) {
+            my $from_idx = $node->{idx};
+            next unless defined $visited_nodes{$from_idx};
+            push @nodes_to_draw, $node;
+            $visited_nodes{$from_idx} = $node;
+            next if $seen{$from_idx};
+            $seen{$from_idx} = 1;
+            push @nodes_to_draw, $node;
+            for my $edge (@{ $node->{edges} }) {
+                my $target = $edge->{target};
+                my $to_idx = $target->{idx};
+                if (!$seen{$to_idx} && !$visited_nodes{$to_idx}) {
+                    $seen{$to_idx} = 1;
+                    push @nodes_to_draw, $target;
+                }
+                my $shadowing = $edge->{shadowing};
+                if (defined $shadowing) {
+                    #my $label = gen_dfa_edge_label($node, $shadowing);
+                    my $target = $shadowing->{target};
+                    my $to_idx = $target->{idx};
+                    if (!$seen{$to_idx} && !$visited_nodes{$to_idx}) {
+                        $seen{$to_idx} = 1;
+                        push @nodes_to_draw, $target;
+                    }
+                }
+            }
+        }
+    }
+
+    @nodes_to_draw = uniq @nodes_to_draw;
+
+    for my $node (@nodes_to_draw) {
+        my $idx = $node->{idx};
+        my $countings = $node->{countings};
+        my $style;
+        if ($countings) {
+            $style = 'filled,dashed';
+        }
+        my $visited = $visited_nodes{$idx};
+        my $label = gen_dfa_node_label($node);
+        $graph->add_node("n$idx", $node->{start} ? (color => 'orange') : (),
+                         $visited ? ($node->{assert_info} ? (fillcolor => 'orange')
+                                                          : ())
+                                  : (fillcolor => 'white'),
+                         $node->{accept} ? (shape => 'doublecircle') : (),
+                         label => $label || " " . $label,
+                         defined $style ? (style => $style) : ());
+    }
+
+    for my $node (@nodes_to_draw) {
+        my $from_idx = $node->{idx};
+        next unless defined $visited_nodes{$from_idx};
+        for my $e (@{ $node->{edges} }) {
+            my $label = gen_dfa_edge_label($node, $e);
+            my $to = $e->{target};
+            my $to_idx = $to->{idx};
+            my $visited = $visited_edges{"$from_idx-$to_idx"};
+            if (defined $visited) {
+                $label = join("", map { "($_)" } @$visited) . " $label";
+            }
+            $graph->add_edge("n$from_idx" => "n$to_idx", label => $label,
+                             $visited ? () : (color => 'grey'),
+                             len => max(length($label) / 7.5, 1.9));
+            my $shadowing = $e->{shadowing};
+            if (defined $shadowing) {
+                #my $label = gen_dfa_edge_label($node, $shadowing);
+                my $to = $shadowing->{target};
+                my $to_idx = $to->{idx};
+                my $visited = $visited_edges{"$from_idx-$to_idx"};
+                if (defined $visited) {
+                    $label = join("", map { "($_)" } @$visited) . " $label";
+                }
+                $graph->add_edge("n$from_idx" => "n$to_idx", label => $label,
+                                 len => max(length($label) / 6, 1.7),
+                                 $visited ? () : (color => 'black'),
+                                 style => 'dashed');
+            }
+        }
+    }
+
+    my $outfile = "dfa-partial.png";
+    $graph->as_png($outfile);
+
+}
+
 sub draw_dfa ($) {
     my ($dfa) = @_;
 
@@ -2329,9 +2477,21 @@ _EOC_
         $src .= "    default:\n        break;\n    }\n";
     }
 
-    if ($seen_accept && @$edges > 1) {
-        $src .= "    }\n";
-        $level--;
+    if ($seen_accept) {
+        if (@$edges > 1) {
+            $src .= "    }\n";
+            $level--;
+        }
+        if ($debug) {
+            my $e = $edges->[0];
+            die unless $e->{to_accept};
+            my $target = $e->{target};
+            my $label = gen_dfa_node_label($target);
+            $label =~ s/\\n/ /g;
+            $src .= <<_EOC_;
+    fprintf(stderr, "* entering accept state $label (i=%d len=%d)\\n", i, (int) len);
+_EOC_
+        }
     }
 
 closing_state:
@@ -2464,6 +2624,9 @@ sub gen_c_from_dfa_edge ($$$$$) {
         if (defined $sibling_assert_settings) {
             my $indent = $indents[$indent_idx];
             $src .= $indent . "if (asserts == $sibling_assert_settings) {\n";
+            if ($debug) {
+                $src .= qq{${indent}    fprintf(stderr, "hit \\"check to-accept\\" sibling (to $target->{idx})\\n");\n};
+            }
 
             for (my $i = 0; $i < $nvec; $i++) {
                 my $assign = "    ovec[$i] = matched_$i;";
@@ -2481,6 +2644,9 @@ sub gen_c_from_dfa_edge ($$$$$) {
             if (defined $shadowing) {
                 my $indent = $indents[$indent_idx];
                 $src .= $indent . "if (asserts != 1) { /* shadowed DFA edge */\n";
+                if ($debug) {
+                    $src .= qq{${indent}    fprintf(stderr, "hit shadowed DFA edge to $target->{idx}\\n");\n};
+                }
                 my ($inner, $to_accept) = gen_c_from_dfa_edge($from_node, $shadowing,
                                                               $level + 2, $nvec, $use_switch);
                 if (defined $inner) {
@@ -2636,7 +2802,7 @@ sub gen_c_from_dfa_edge ($$$$$) {
         for my $subedge (@$assert_edges) {
             my $assert_settings = $subedge->{assert_settings};
             #die unless ref $assert_settings;
-            my $target = $subedge->{target};
+            my $sub_target = $subedge->{target};
             my $indent2;
             if ($use_default && $subedge eq $assert_edges->[-1]) {
                 $src .= $indent . "{ /* asserts == $assert_settings */\n";
@@ -2644,16 +2810,19 @@ sub gen_c_from_dfa_edge ($$$$$) {
                 $src .= $indent . "if (asserts == $assert_settings) {\n";
             }
             $indent2 = $indent . (" " x 4);
-            if ($target->{accept}) {
+            if ($debug) {
+                $src .= qq{${indent2}fprintf(stderr, "hit assertion DFA node $target->{idx}\\n");\n};
+            }
+            if ($sub_target->{accept}) {
                 $to_accept = 1;
             }
-            $src .= gen_capture_handler_c_code($subedge, $target->{accept}, $indent2, $nvec);
+            $src .= gen_capture_handler_c_code($subedge, $sub_target->{accept}, $indent2, $nvec);
             if (!$to_accept) {
                 # we don't care about cleanup for to-accept states.
                 $src .= gen_edge_action_c_code($subedge, $indent2);
             }
 
-            my $to = $target->{idx};
+            my $to = $sub_target->{idx};
             if (!$to_accept) {
                 $src .= $indent2 . "goto st$to;\n";
             }
