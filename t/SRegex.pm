@@ -319,7 +319,7 @@ sub parse_sregex_dfa_res ($$) {
     #warn "data: $data";
     my ($res, $err);
     #warn @opts;
-    #my @cmd = ("./re.pl", "--debug=0", "--cc=clang -O2 -g -fsanitize=address -fno-omit-frame-pointer", "-o", "./a.out", "--stdin", $re);
+    #my @cmd = ("./re.pl", "--debug=0", "--cc=clang -O -g -fsanitize=address -fno-omit-frame-pointer", "-o", "./a.out", "--stdin", $re);
     #my @cmd = ("./re.pl", "--debug=0", "--cc=clang -O -g", "-o", "./a.out", "--stdin", $re);
     #my @cmd = ("./re.pl", "--debug=0", "--cc=gcc -O", "-o", "./a.out", "--stdin", $re);
     my @cmd = ("./re.pl", "--debug=0", "--cc=tcc", "--stdin", $re);

@@ -1700,11 +1700,10 @@ sub draw_partial_dfa ($$) {
         for my $node (@$dfa_nodes) {
             my $from_idx = $node->{idx};
             next unless defined $visited_nodes{$from_idx};
-            push @nodes_to_draw, $node;
-            $visited_nodes{$from_idx} = $node;
             next if $seen{$from_idx};
             $seen{$from_idx} = 1;
             push @nodes_to_draw, $node;
+            $visited_nodes{$from_idx} = $node;
             for my $edge (@{ $node->{edges} }) {
                 my $target = $edge->{target};
                 my $to_idx = $target->{idx};
@@ -1726,7 +1725,7 @@ sub draw_partial_dfa ($$) {
         }
     }
 
-    @nodes_to_draw = uniq @nodes_to_draw;
+    #@nodes_to_draw = uniq @nodes_to_draw;
 
     for my $node (@nodes_to_draw) {
         my $idx = $node->{idx};
