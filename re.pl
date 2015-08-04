@@ -2623,6 +2623,7 @@ _EOC_
             $src .= "    }\n";
             $level--;
         }
+
         if ($debug) {
             my $e = $edges->[0];
             die unless $e->{to_accept};
