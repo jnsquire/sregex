@@ -928,8 +928,10 @@ sub calc_capture_mapping ($$) {
     my $src_states = $from_node->{states};
     my (@mappings, %assigned);
     my $from_row = 0;
-    #warn "src $from_node->{idx} {", join(",", @$src_states),
-        #"} => dst $dfa_edge->{target}{idx} ",
+    #if ($from_node->{idx} == 2 && $dfa_edge->{target}{idx} == 4) {
+        #warn "src $from_node->{idx} {", join(",", @$src_states),
+        #"} => dst $dfa_edge->{target}{idx} ";
+    #}
     #gen_dfa_node_label($dfa_edge->{target}), "\n";
     for my $raw_src_state (@$src_states) {
         my $src_state = abs $raw_src_state;
@@ -940,12 +942,21 @@ sub calc_capture_mapping ($$) {
             my $dst_state = abs $nfa_edge->[-1];
             my $to_row = $seen_dst_state{$dst_state};
             if (!defined $to_row) {
-                $seen_dst_state{$dst_state} = 1;
                 $to_row = $to_row_cnt;
+                $seen_dst_state{$dst_state} = $to_row;
+                #if ($from_node->{idx} == 2 && $dfa_edge->{target}{idx} == 4) {
+                    #warn "to row miss $to_row (dst state $dst_state)";
+                    #}
             } else {
+                #if ($from_node->{idx} == 2 && $dfa_edge->{target}{idx} == 4) {
+                    #warn "to row hit $to_row (dst state $dst_state)";
+                    #}
                 $to_row_cnt--;
             }
             my $key = "$src_state-$to_pc";
+            #if ($from_node->{idx} == 2 && $dfa_edge->{target}{idx} == 4) {
+                #warn "row $from_row ($src_state) => row $to_row ($dst_state)";
+                #}
             if (!$assigned{$to_row} && $nfa_paths{$key}) {
                 my $src_counting = $counter_sets{$src_state};
                 if (defined $src_counting) {
@@ -958,14 +969,20 @@ sub calc_capture_mapping ($$) {
                         # hiding subsequent edges with "addcnt" actions which
                         # does real jobs.
                         #warn "@$bc";
-                        #warn "  skipped mapping: $from_row => $to_row\n";
+                        #if ($from_node->{idx} == 17) { # && $dfa_edge->{target}{idx} == 8) {
+                            #warn "  skipped mapping: $from_row => $to_row ($dfa_edge->{target}{idx})";
+                            #}
                         next;
                         #warn "  mapping: $from_row => $to_row\n";
                     }
                 }
-                #warn "  mapping: $from_row => $to_row\n";
+                #if ($from_node->{idx} == 17) { # && $dfa_edge->{target}{idx} == 8) {
+                    #warn "  mapping: $from_row => $to_row ($dfa_edge->{target}{idx})";
+                    #}
                 push @mappings, [$from_row, $to_row, $src_state, $dst_state];
+                #if (!$counter_sets{$dst_state}) {
                 $assigned{$to_row} = 1;
+                #}
             }
         } continue {
             $to_row_cnt++;
@@ -1812,6 +1829,17 @@ sub draw_partial_dfa ($$) {
                 if (!$seen{$to_idx} && !$visited_nodes{$to_idx}) {
                     $seen{$to_idx} = 1;
                     push @nodes_to_draw, $target;
+                    if ($target->{assert_info}) {
+                        my $subedges = $target->{edges};
+                        for my $subedge (@$subedges) {
+                            my $subtar = $subedge->{target};
+                            my $to_idx = $subtar->{idx};
+                            if (!$seen{$to_idx}) {
+                                $seen{$to_idx} = 1;
+                                push @nodes_to_draw, $subtar;
+                            }
+                        }
+                    }
                 }
                 my $shadowing = $edge->{shadowing};
                 if (defined $shadowing) {
@@ -1821,6 +1849,17 @@ sub draw_partial_dfa ($$) {
                     if (!$seen{$to_idx} && !$visited_nodes{$to_idx}) {
                         $seen{$to_idx} = 1;
                         push @nodes_to_draw, $target;
+                        if ($target->{assert_info}) {
+                            my $subedges = $target->{edges};
+                            for my $subedge (@$subedges) {
+                                my $subtar = $subedge->{target};
+                                my $to_idx = $subtar->{idx};
+                                if (!$seen{$to_idx}) {
+                                    $seen{$to_idx} = 1;
+                                    push @nodes_to_draw, $subtar;
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1841,7 +1880,8 @@ sub draw_partial_dfa ($$) {
         $graph->add_node("n$idx", $node->{start} ? (color => 'orange') : (),
                          $visited ? ($node->{assert_info} ? (fillcolor => 'orange')
                                                           : ())
-                                  : (fillcolor => 'white'),
+                                  : ($node->{assert_info} ? (fillcolor => 'moccasin')
+                                                          : (fillcolor => 'white')),
                          $node->{accept} ? (shape => 'doublecircle') : (),
                          label => $label || " " . $label,
                          defined $style ? (style => $style) : ());
@@ -1849,7 +1889,7 @@ sub draw_partial_dfa ($$) {
 
     for my $node (@nodes_to_draw) {
         my $from_idx = $node->{idx};
-        next unless defined $visited_nodes{$from_idx};
+        next unless defined $visited_nodes{$from_idx} || $node->{assert_info};
         for my $e (@{ $node->{edges} }) {
             my $label = gen_dfa_edge_label($node, $e);
             my $to = $e->{target};
@@ -1880,7 +1920,6 @@ sub draw_partial_dfa ($$) {
 
     my $outfile = "dfa-partial.png";
     $graph->as_png($outfile);
-
 }
 
 sub draw_dfa ($) {
