@@ -328,7 +328,7 @@ draw_dfa($dfa) if $debug > 1;
 
 #exit;
 my $c = gen_c_from_dfa($dfa);
-warn dump_code($c) if $debug == 2;
+warn dump_code($c) if $debug > 2;
 #$begin = time;
 {
     my ($fh, $fname);
@@ -2974,6 +2974,7 @@ sub gen_capture_handler_c_code ($$$$) {
     my $mappings = $edge->{capture_mappings};
     my $nfa_edges = $edge->{nfa_edges};
 
+    my %echo_values;
     my (%to_save_rows, %overwritten, @stores, %to_be_stored, %new_cnt_ovec);
     for my $mapping (@$mappings) {
         my ($from_row, $to_row, $from_pc, $to_pc) = @$mapping;
@@ -2986,11 +2987,17 @@ sub gen_capture_handler_c_code ($$$$) {
                 my $id = $bc->[1];
                 if ($to_accept) {
                     push @stores, "matched_$id = i - 1;";
+                    if ($debug > 1) {
+                        $echo_values{"matched_$id"} = 1;
+                    }
                 } else {
                     my $to_var = gen_dst_cap_var($to_row, $id, $to_pc);
                     push @stores, "$to_var = i - 1;";
                     # TODO: skip newly initialized ovector in counter set states.
                     $to_be_stored{"$to_row-$id"} = 1;
+                    if ($debug > 1) {
+                        $echo_values{$to_var} = 1;
+                    }
                 }
             }
         }
@@ -3028,6 +3035,9 @@ sub gen_capture_handler_c_code ($$$$) {
             for (my $i = 0; $i < $nvec; $i++) {
                 my $from_var = gen_src_cap_var($from_row, $i, $from_pc);
                 $t .= $indent . "matched_$i = $from_var;\n";
+                if ($debug > 1) {
+                    $echo_values{"matched_$i"} = 1;
+                }
             }
             push @transfers, $t;
 
@@ -3048,6 +3058,9 @@ sub gen_capture_handler_c_code ($$$$) {
                         $from_var = gen_src_cap_var($from_row, $i, $from_pc);
                     }
                     $t .= $indent . "$to_var = $from_var;\n";
+                    if ($debug > 1) {
+                        $echo_values{$to_var} = 1;
+                    }
                 }
             }
             if (!defined $to_cntset) {
@@ -3111,13 +3124,24 @@ _EOC_
     }
 
     if (@stores) {
+        $src .= $indent . "/* capture stores */\n";
         $src .= $indent . join("\n$indent", @stores) . "\n";
         if ($debug > 1) {
+            $src .= $indent . qq{fprintf(stderr, "$indent/* capture stores */\\n");\n};
             $src .= $indent . join "\n$indent",
                                     map { (my $s = $_) =~ s/"/\\"/g;
                                           $s =~ s/\n/\\n/g;
                                           qq/fprintf(stderr, "$indent$s\\n");\n/;
                                         } @stores;
+        }
+    }
+
+    if (%echo_values) {
+        if (@stores) {
+            $src .= $indent . qq/fprintf(stderr, "\\n");/;
+        }
+        for my $var (sort keys %echo_values) {
+            $src .= $indent . qq/fprintf(stderr, "${indent}$var: %d\\n", $var);/;
         }
     }
 
