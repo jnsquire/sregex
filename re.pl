@@ -91,6 +91,7 @@ sub gen_dfa ($);
 sub dedup_nfa_edges ($);
 sub reorder_nfa_edges ($$);
 sub draw_dfa ($);
+sub draw_partial_dfa ($$);
 sub escape_range ($$);
 sub gen_dfa_hash_key ($$);
 sub add_to_set ($$);
@@ -132,7 +133,11 @@ if (!defined $timer) {
 }
 
 if (!$repeat) {
-    $repeat = 5;
+    if ($timer) {
+        $repeat = 5;
+    } else {
+        $repeat = 1;
+    }
 }
 
 $Data::Dumper::Terse = 1;
@@ -357,6 +362,24 @@ warn dump_code($c) if $debug == 2;
 
     if (!defined $out) {
         die "program crashed: $rc";
+    }
+
+    if ($debug && $err) {
+        my @route;
+        open my $in, "<", \$err or die $!;
+        while (<$in>) {
+            #warn "!! $_";
+            next if /^\s*$/;
+            if (/^\* entering (?:accept )?state \{[^}]+\} (\d+)/) {
+                my $state = $1;
+                push @route, $state;
+            } elsif (/^hit assertion DFA node (\d+)/) {
+                my $state = $1;
+                push @route, $state;
+            }
+        }
+        close $in;
+        draw_partial_dfa($dfa, \@route);
     }
 
     print $out;
@@ -1394,6 +1417,156 @@ sub add_to_hash ($$) {
     }
 }
 
+sub draw_partial_dfa ($$) {
+    my ($dfa, $route) = @_;
+
+    my (%visited_nodes, %visited_edges);
+    {
+        my $prev_node;
+        my $i = 0;
+        for my $node_idx (@$route) {
+            #warn "Found visited node idx $node_idx";
+            $visited_nodes{$node_idx} = 1;
+            if (!defined $prev_node) {
+                # first node
+            } else {
+                # got a new edge
+                my $key = "$prev_node-$node_idx";
+                my $values = $visited_edges{$key};
+                my $v = ++$i;
+                if (defined $values) {
+                    push @$values, $v;
+                } else {
+                    $values = [$v];
+                    $visited_edges{$key} = $values;
+                }
+            }
+        } continue {
+            $prev_node = $node_idx;
+        }
+    }
+
+    my $dfa_nodes = $dfa->{nodes};
+
+    undef $node_attr->{height};
+    undef $edge_attr->{arrowsize};
+
+    my $graph = GraphViz->new(
+        layout => 'neato',
+        ratio => 'auto',
+        node => $node_attr,
+        edge => $edge_attr,
+    );
+
+    my @nodes_to_draw;
+    {
+        my %seen;
+        for my $node (@$dfa_nodes) {
+            my $from_idx = $node->{idx};
+            next unless defined $visited_nodes{$from_idx};
+            next if $seen{$from_idx};
+            $seen{$from_idx} = 1;
+            push @nodes_to_draw, $node;
+            $visited_nodes{$from_idx} = $node;
+            for my $edge (@{ $node->{edges} }) {
+                my $target = $edge->{target};
+                my $to_idx = $target->{idx};
+                if (!$seen{$to_idx} && !$visited_nodes{$to_idx}) {
+                    $seen{$to_idx} = 1;
+                    push @nodes_to_draw, $target;
+                    if ($target->{assert_info}) {
+                        my $subedges = $target->{edges};
+                        for my $subedge (@$subedges) {
+                            my $subtar = $subedge->{target};
+                            my $to_idx = $subtar->{idx};
+                            if (!$seen{$to_idx}) {
+                                $seen{$to_idx} = 1;
+                                push @nodes_to_draw, $subtar;
+                            }
+                        }
+                    }
+                }
+                my $shadowing = $edge->{shadowing};
+                if (defined $shadowing) {
+                    #my $label = gen_dfa_edge_label($node, $shadowing);
+                    my $target = $shadowing->{target};
+                    my $to_idx = $target->{idx};
+                    if (!$seen{$to_idx} && !$visited_nodes{$to_idx}) {
+                        $seen{$to_idx} = 1;
+                        push @nodes_to_draw, $target;
+                        if ($target->{assert_info}) {
+                            my $subedges = $target->{edges};
+                            for my $subedge (@$subedges) {
+                                my $subtar = $subedge->{target};
+                                my $to_idx = $subtar->{idx};
+                                if (!$seen{$to_idx}) {
+                                    $seen{$to_idx} = 1;
+                                    push @nodes_to_draw, $subtar;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #@nodes_to_draw = uniq @nodes_to_draw;
+
+    for my $node (@nodes_to_draw) {
+        my $idx = $node->{idx};
+        my $countings = $node->{countings};
+        my $style;
+        if ($countings) {
+            $style = 'filled,dashed';
+        }
+        my $visited = $visited_nodes{$idx};
+        my $label = gen_dfa_node_label($node);
+        $graph->add_node("n$idx", $node->{start} ? (color => 'orange') : (),
+                         $visited ? ($node->{assert_info} ? (fillcolor => 'orange')
+                                                          : ())
+                                  : ($node->{assert_info} ? (fillcolor => 'moccasin')
+                                                          : (fillcolor => 'white')),
+                         $node->{accept} ? (shape => 'doublecircle') : (),
+                         label => $label || " " . $label,
+                         defined $style ? (style => $style) : ());
+    }
+
+    for my $node (@nodes_to_draw) {
+        my $from_idx = $node->{idx};
+        next unless defined $visited_nodes{$from_idx} || $node->{assert_info};
+        for my $e (@{ $node->{edges} }) {
+            my $label = gen_dfa_edge_label($node, $e);
+            my $to = $e->{target};
+            my $to_idx = $to->{idx};
+            my $visited = $visited_edges{"$from_idx-$to_idx"};
+            if (defined $visited) {
+                $label = join("", map { "($_)" } @$visited) . " $label";
+            }
+            $graph->add_edge("n$from_idx" => "n$to_idx", label => $label,
+                             $visited ? () : (color => 'grey'),
+                             len => max(length($label) / 7.5, 1.9));
+            my $shadowing = $e->{shadowing};
+            if (defined $shadowing) {
+                #my $label = gen_dfa_edge_label($node, $shadowing);
+                my $to = $shadowing->{target};
+                my $to_idx = $to->{idx};
+                my $visited = $visited_edges{"$from_idx-$to_idx"};
+                if (defined $visited) {
+                    $label = join("", map { "($_)" } @$visited) . " $label";
+                }
+                $graph->add_edge("n$from_idx" => "n$to_idx", label => $label,
+                                 len => max(length($label) / 6, 1.7),
+                                 $visited ? () : (color => 'black'),
+                                 style => 'dashed');
+            }
+        }
+    }
+
+    my $outfile = "dfa-partial.png";
+    $graph->as_png($outfile);
+}
+
 sub draw_dfa ($) {
     my ($dfa) = @_;
 
@@ -1482,8 +1655,8 @@ sub gen_dfa_node_label ($) {
     #return "0";
     #}
     my @lines = "{" . join(",", @{ $node->{states} }) . "}";
-    push @lines, "[" . $node->{idx} . "]";
-    if (defined $node->{min_len}) {
+    push @lines, $node->{idx};
+    if ($debug == 2 && defined $node->{min_len}) {
         push @lines, "∧=$node->{min_len}";
     }
     return join "\\n", @lines;
@@ -1791,7 +1964,7 @@ sub gen_c_from_dfa_node ($$) {
 
     my $edges = $node->{edges};
 
-    $src .= qq{    fprintf(stderr, "entering state $label\\n");\n} if $debug;
+    $src .= qq{    fprintf(stderr, "* entering state $label (i=%d len=%d)\\n", i, (int) len);\n} if $debug;
 
     my $used_error;
 
@@ -1996,10 +2169,6 @@ _EOC_
     if ($gen_read_char && @$edges) {
         if ($edges->[0]{to_accept}) {
             $src .= "    c = i < len ? s[i++] : (i++, -1);\n";
-            if ($debug) {
-                $src .= qq{     fprintf(stderr, "reading new char \\"%d\\"\\n", c);\n};
-            }
-
             $to_accept = 1;
 
         } else {
@@ -2012,10 +2181,10 @@ _EOC_
     c = s[i++];
 _EOC_
             $used_error = 1;
+        }
 
-            if ($debug) {
-                $src .= qq{    fprintf(stderr, "reading new char \\"%d\\"\\n", c);\n};
-            }
+        if ($debug) {
+            $src .= qq{    fprintf(stderr, "reading new char %d (offset %d)\\n", c, i - 1);\n};
         }
     }
 
@@ -2050,6 +2219,16 @@ _EOC_
     if ($seen_accept && @$edges > 1) {
         $src .= "    }\n";
         $level--;
+        if ($debug) {
+            my $e = $edges->[0];
+            die unless $e->{to_accept};
+            my $target = $e->{target};
+            my $label = gen_dfa_node_label($target);
+            $label =~ s/\\n/ /g;
+            $src .= <<_EOC_;
+    fprintf(stderr, "* entering accept state $label (i=%d len=%d)\\n", i, (int) len);
+_EOC_
+        }
     }
 
 closing_state:
@@ -2393,6 +2572,7 @@ sub gen_capture_handler_c_code ($$$$) {
     my $mappings = $edge->{capture_mappings};
     my $nfa_edges = $edge->{nfa_edges};
 
+    my %echo_values;
     my (%to_save_rows, %overwritten, @stores, %to_be_stored);
     for my $mapping (@$mappings) {
         my ($from_row, $to_row) = @$mapping;
@@ -2405,9 +2585,16 @@ sub gen_capture_handler_c_code ($$$$) {
                 my $id = $bc->[1];
                 if ($to_accept) {
                     push @stores, "matched_$id = i - 1;";
+                    if ($debug > 1) {
+                        $echo_values{"matched_$id"} = 1;
+                    }
                 } else {
-                    push @stores, "caps${to_row}_$id = i - 1;";
+                    my $to_var = "caps${to_row}_$id";
+                    push @stores, "$to_var = i - 1;";
                     $to_be_stored{"$to_row-$id"} = 1;
+                    if ($debug > 1) {
+                        $echo_values{$to_var} = 1;
+                    }
                 }
             } elsif ($bcname eq 'assert') {
                 #warn "TODO: assertions";
@@ -2434,6 +2621,9 @@ sub gen_capture_handler_c_code ($$$$) {
             my $t = $indent . "/* transfer caps from row $from_row to matched */\n";
             for (my $i = 0; $i < $nvec; $i++) {
                 $t .= $indent . "matched_$i = caps${from_row}_$i;\n";
+                if ($debug > 1) {
+                    $echo_values{"matched_$i"} = 1;
+                }
             }
             push @transfers, $t;
 
@@ -2452,6 +2642,9 @@ sub gen_capture_handler_c_code ($$$$) {
                         $from_var = "caps${from_row}_$i";
                     }
                     $t .= $indent . "$to_var = $from_var;\n";
+                    if ($debug > 1) {
+                        $echo_values{$to_var} = 1;
+                    }
                 }
             }
             $overwritten{$to_row} = 1;
@@ -2474,13 +2667,37 @@ sub gen_capture_handler_c_code ($$$$) {
             $src .= $indent . "int " .  join(", ", @tmp) . ";\n";
         }
         $src .= join "", @transfers;
+        if ($debug > 1) {
+            $src .= join "", map { (my $s = $_) =~ s/"/\\"/g;
+                                   $s =~ s/\n/\\n/g;
+                                   qq/${indent}fprintf(stderr, "$s\\n");\n/;
+                                 } @transfers;
+        }
         if (%to_save_rows) {
             $src .= $indent . "}\n";
         }
     }
 
     if (@stores) {
+        $src .= $indent . "/* capture stores */\n";
         $src .= $indent . join("\n$indent", @stores) . "\n";
+        if ($debug > 1) {
+            $src .= $indent . qq{fprintf(stderr, "$indent/* capture stores */\\n");\n};
+            $src .= $indent . join "\n$indent",
+                                    map { (my $s = $_) =~ s/"/\\"/g;
+                                          $s =~ s/\n/\\n/g;
+                                          qq/fprintf(stderr, "$indent$s\\n");\n/;
+                                        } @stores;
+        }
+    }
+
+    if (%echo_values) {
+        if (@stores) {
+            $src .= $indent . qq/fprintf(stderr, "\\n");/;
+        }
+        for my $var (sort keys %echo_values) {
+            $src .= $indent . qq/fprintf(stderr, "${indent}$var: %d\\n", $var);/;
+        }
     }
 
     return $src;
