@@ -1654,7 +1654,7 @@ sub gen_dfa_node_label ($) {
     #if ($node->{start}) {
     #return "0";
     #}
-    my @lines = "{" . join(",", @{ $node->{states} }) . "}";
+    my @lines = "{" . join(",", uniq @{ $node->{states} }) . "}";
     push @lines, $node->{idx};
     if ($debug == 2 && defined $node->{min_len}) {
         push @lines, "∧=$node->{min_len}";
@@ -2216,9 +2216,12 @@ _EOC_
         $src .= "    default:\n        break;\n    }\n";
     }
 
-    if ($seen_accept && @$edges > 1) {
-        $src .= "    }\n";
-        $level--;
+    if ($seen_accept) {
+        if (@$edges > 1) {
+            $src .= "    }\n";
+            $level--;
+        }
+
         if ($debug) {
             my $e = $edges->[0];
             die unless $e->{to_accept};
