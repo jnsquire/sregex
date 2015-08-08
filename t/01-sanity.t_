@@ -1557,14 +1557,26 @@ re1 and re2 are wrong here.
 
 
 
-=== TEST 251: parallel 0-width assertions (1)
+=== TEST 251: \&
+--- re: a\&b
+--- s eval: 'a&b'
+
+
+
+=== TEST 252: [\&]
+--- re: a[\&]b
+--- s eval: 'a&b'
+
+
+
+=== TEST 253: parallel 0-width assertions (1)
 --- re eval: ' (?:(\b)|($))'
 --- s eval: " a"
 --- cap: (0, 1) (1, 1)
 
 
 
-=== TEST 252: parallel 0-width assertions (2)
+=== TEST 254: parallel 0-width assertions (2)
 --- re eval: ' (?:(\b)|($))'
 --- s eval: " \n"
 --- cap: (0, 1) (-1, -1) (1, 1)
