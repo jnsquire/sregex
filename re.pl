@@ -298,7 +298,7 @@ draw_dfa($dfa) if $debug;
 
 #exit;
 my $c = gen_c_from_dfa($dfa);
-warn dump_code($c) if $debug == 2;
+warn dump_code($c) if $debug > 2;
 #$begin = time;
 {
     my ($fh, $fname);
