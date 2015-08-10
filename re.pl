@@ -367,15 +367,17 @@ warn dump_code($c) if $debug > 2;
     if ($debug && $err) {
         my @route;
         open my $in, "<", \$err or die $!;
+        my $ofs;
         while (<$in>) {
             #warn "!! $_";
             next if /^\s*$/;
-            if (/^\* entering (?:accept )?state \{[^}]+\} (\d+)/) {
+            if (/^\* entering (?:accept )?state \{[^}]+\} (\d+) .*?\(i=(\d+) /) {
                 my $state = $1;
-                push @route, $state;
+                push @route, [$state, $ofs];
+                $ofs = $2;
             } elsif (/^hit assertion DFA node (\d+)/) {
                 my $state = $1;
-                push @route, $state;
+                push @route, [$state, $ofs];
             }
         }
         close $in;
@@ -1422,9 +1424,10 @@ sub draw_partial_dfa ($$) {
 
     my (%visited_nodes, %visited_edges);
     {
-        my $prev_node;
-        my $i = 0;
-        for my $node_idx (@$route) {
+        my ($prev_node, $node_idx);
+        for my $rec (@$route) {
+            my $ofs;
+            ($node_idx, $ofs) = @$rec;
             #warn "Found visited node idx $node_idx";
             $visited_nodes{$node_idx} = 1;
             if (!defined $prev_node) {
@@ -1433,11 +1436,10 @@ sub draw_partial_dfa ($$) {
                 # got a new edge
                 my $key = "$prev_node-$node_idx";
                 my $values = $visited_edges{$key};
-                my $v = ++$i;
                 if (defined $values) {
-                    push @$values, $v;
+                    push @$values, $ofs;
                 } else {
-                    $values = [$v];
+                    $values = [$ofs];
                     $visited_edges{$key} = $values;
                 }
             }
@@ -2012,6 +2014,8 @@ _EOC_
             $a->{default_branch} = 1;
             my ($a_src) = gen_c_from_dfa_edge($node, $a, $level, $nvec, undef);
             delete $a->{default_branch};
+
+            $src .= qq{    fprintf(stderr, "* entering state $label (i=%d len=%d)\\n", i, (int) len);\n} if $debug;
             $src .= $a_src;
 
             goto closing_state;
@@ -2249,7 +2253,11 @@ closing_state:
     }
 
     for (my $i = 0; $i < $nvec; $i++) {
-        $src .= $indent . "    ovec[$i] = matched_$i;\n";
+        my $assign = "    ovec[$i] = matched_$i;";
+        $src .= $indent . "$assign\n";
+        if ($debug > 1) {
+            $src .= $indent . qq{    fprintf(stderr, "$assign\\n");\n};
+        }
     }
 
     $src .= $indent . "    return MATCHED;  /* fallback */\n";
