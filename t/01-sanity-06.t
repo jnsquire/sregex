@@ -29,3 +29,51 @@ __DATA__
 --- re eval: ' (?:(\b)|($))'
 --- s eval: " \n"
 --- cap: (0, 1) (-1, -1) (1, 1)
+
+
+
+=== TEST 5: testinput1:1523 (minimized)
+--- re: .*.{3}
+--- s eval: "abcde"
+
+
+
+=== TEST 6: testinput1:1523 (minimized 2)
+--- re: [^c]*.{3}
+--- s eval: "Tccc"
+
+
+
+=== TEST 7: testinput1:1523 (minimized 2)
+--- re: [^c]*?.{3}
+--- s eval: "Tccc"
+
+
+
+=== TEST 8: re_tests:472 (3 + 1)
+--- re: (a{3})+
+--- s eval: "aaaa"
+
+
+
+=== TEST 9: re_tests:472 (3 + 2)
+--- re: (a{3})+
+--- s eval: "aaaaa"
+
+
+
+=== TEST 10: re_tests:472 (3 * 2 + 1)
+--- re: (a{3})+
+--- s eval: "aaaaaaa"
+
+
+
+=== TEST 11: re_tests:916 (minimized)
+--- re: .{3}a
+--- s eval: "123\na"
+
+
+
+=== TEST 12: re_tests:916 (minimized 2)
+--- re: ^.{3}a
+--- s eval: "\nabca"
