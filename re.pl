@@ -2172,7 +2172,7 @@ _EOC_
 
     if ($gen_read_char && @$edges) {
         if ($edges->[0]{to_accept}) {
-            $src .= "    c = i < len ? s[i++] : (i++, -1);\n";
+            $src .= "    c = i < len ? s[i] : -1;\n    i++;\n";
             $to_accept = 1;
 
         } else {
