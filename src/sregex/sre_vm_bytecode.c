@@ -14,10 +14,17 @@
 SRE_API void
 sre_program_dump(sre_program_t *prog)
 {
+    sre_uint_t              i;
     sre_instruction_t      *pc, *start, *end;
 
     start = prog->start;
     end = prog->start + prog->len;
+
+    printf("# of captures:");
+    for (i = 0; i < prog->nregexes; i++) {
+        printf(" %d", (int) prog->multi_ncaps[i]);
+    }
+    printf("\n");
 
     for (pc = start; pc < end; pc++) {
         sre_dump_instruction(stdout, pc, start);

@@ -174,7 +174,7 @@ main(int argc, char **argv)
     sre_regex_dump(re);
     printf("\n");
 
-    printf("captures: %ld\n", (long) ncaps);
+    /* printf("captures: %ld\n", (long) ncaps); */
 
     cpool = sre_create_pool(1024);
     if (cpool == NULL) {

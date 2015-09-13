@@ -70,13 +70,17 @@ use Data::Dumper qw( Dumper );
 use GraphViz ();
 #use Time::HiRes qw( time );
 use List::MoreUtils qw( uniq firstidx );
-use List::Util qw( first max );
+use List::Util qw( first max sum );
 use Carp qw( croak carp );
 use Getopt::Long qw( GetOptions );
 use File::Temp qw( tempfile );
 use POSIX qw( tmpnam );
 use File::Spec ();
 use FindBin ();
+use constant {
+    # just for easily testing multi-regex cases with the single-regex case:
+    SINGLE_REGEX => 1,
+};
 
 sub add_nfa_edges ($$$$);
 sub gen_nfa_edge_label ($);
@@ -110,15 +114,18 @@ sub gen_c_from_dfa_node ($$);
 sub dump_code ($);
 sub count_chars_and_holes_in_ranges ($);
 sub analyze_dfa ($);
+sub gen_ovec_id_range ($);
 
 my $cc = "cc";
 my $debug = 0;
 
 GetOptions("help|h",        \(my $help),
            "cc=s",          \$cc,
+           "flags=s",       \(my $flags),
            "repeat=i",      \(my $repeat),
            "debug=i",       \$debug,
            "g",             \(my $global),
+           "n=i",           \(my $nregexes),
            "out|o=s",       \(my $exefile),
            "timer",         \(my $timer),
            "stdin",         \(my $stdin))
@@ -126,6 +133,15 @@ GetOptions("help|h",        \(my $help),
 
 if ($help) {
     usage(0);
+}
+
+if (!defined $nregexes) {
+    $nregexes = 1;
+
+} else {
+    if ($nregexes <= 0) {
+        die "ERROR: -n option takes positive integer values but got $nregexes\n";
+    }
 }
 
 if (!defined $timer) {
@@ -142,10 +158,19 @@ if (!$repeat) {
 
 $Data::Dumper::Terse = 1;
 
-my $re = shift;
-if (!defined $re) {
+if (@ARGV == 0) {
     warn "No regex specified.\n";
     usage(1);
+}
+
+my @regexes;
+for (my $i = 1; $i <= $nregexes; $i++) {
+    my $re = shift;
+    if (!defined $re) {
+        warn "ERROR: expecting $nregexes regexes but only got ", $i - 1, ".\n";
+        usage(1);
+    }
+    push @regexes, $re;
 }
 
 my $subject;
@@ -172,11 +197,22 @@ if ($stdin) {
 #die "subject: $subject";
 
 my @opts;
-# a hack to work-around the lack of support of (?i) in the sregex frontend.
-if ($re =~ s/^\(\?i\)//) {
+
+# a quick dirty hack to work-around the lack of support of (?i) in the sregex frontend.
+if (@regexes == 1 && $regexes[0] =~ s/^\(\?i\)//) {
     push @opts, "--flags", "i";
 }
-my @cmd = ("$FindBin::Bin/sregex-cli", @opts, $re);
+
+if (defined $flags) {
+    push @opts, "--flags", $flags;
+}
+
+if (@regexes > 1) {
+    push @opts, "-n", $nregexes;
+}
+
+my @cmd = ("$FindBin::Bin/sregex-cli", @opts, @regexes);
+
 run3 \@cmd, undef, \(my $res), \(my $err);
 
 if (!$res) {
@@ -189,10 +225,19 @@ if (!$res) {
 warn "$res" if $debug;
 open my $in, "<", \$res or die $!;
 
-my (@bytecodes, $found);
+my (@bytecodes, $found, @multi_ncaps);
 while (<$in>) {
     if (!$found) {
+        if (!@multi_ncaps && /^\# of captures:((?: \d+)+)$/) {
+            (my $list = $1) =~ s/^\s+|\s+$//g;
+            @multi_ncaps = split /\s+/, $list;
+            #warn "multi ncaps: ", join ", ", @multi_ncaps;
+        }
+
         if (/^ 0\. split/) {
+            if (!@multi_ncaps) {
+                die "No number of captures found\n";
+            }
             $found = 1;
 
         } else {
@@ -214,7 +259,12 @@ while (<$in>) {
             push @bytecodes, [$opcode, @args];
 
         } else {
-            push @bytecodes, $opcode;
+            if ($opcode eq 'match') {
+                # just to make testing easier
+                push @bytecodes, [$opcode, 0];
+            } else {
+                push @bytecodes, $opcode;
+            }
         }
 
     } else {
@@ -389,7 +439,6 @@ warn dump_code($c) if $debug > 2;
 
 sub gen_nfa () {
     my @nodes;
-    my $max_cap = 0;
     my $idx = 0;
     for my $bc (@bytecodes) {
         my $opcode = opcode($bc);
@@ -399,11 +448,6 @@ sub gen_nfa () {
                 #warn "new assert $bc->[1]";
                 $pc2assert{$idx} = $bc->[1];
                 $found = 1;
-            }
-        } elsif ($opcode eq 'save') {
-            my $n = $bc->[1];
-            if ($n > $max_cap) {
-                $max_cap = $n;
             }
         }
 
@@ -441,7 +485,7 @@ sub gen_nfa () {
 
     return {
         nodes => \@nodes,
-        nvec => $max_cap + 1,
+        nvec => sum map { ($_ + 1) * 2 } @multi_ncaps,
     }
 }
 
@@ -454,7 +498,7 @@ sub draw_nfa ($) {
     if (@$nfa_nodes >= 20) {
         $node_attr->{height} = 0.1;
         $edge_attr->{arrowsize} = 0.5;
-        $big = 1;
+        #$big = 1;
     } else {
         undef $node_attr->{height};
         undef $edge_attr->{arrowsize};
@@ -673,7 +717,8 @@ sub gen_dfa ($) {
             $dfa_node->{edges} = $dfa_edges;
             if ($dfa_node->{accept}) {
                 for my $dfa_edge (@$dfa_edges) {
-                    $dfa_edge->{target}{accept} = 1;
+                    my $target = $dfa_edge->{target};
+                    $target->{accept} = [gen_ovec_id_range($target->{states})];
                 }
                 delete $dfa_node->{accept};
             }
@@ -1161,7 +1206,7 @@ sub resolve_dfa_edge ($$$$$$$$) {
         edges => undef,
         states => \@states,
         idx => $$idx_ref++,
-        $is_accept ? (accept => 1) : (),
+        $is_accept ? (accept => defined $assert_info ? 1 : [gen_ovec_id_range(\@states)]) : (),
     };
     #if ($target_dfa_node->{idx} == 319) {
     #warn "from node: ", Dumper($from_node);
@@ -1738,8 +1783,16 @@ $getcputime
 
 
 enum {
-    NO_MATCH = 0,
-    MATCHED  = 1,
+    NO_MATCH = -1,
+_EOC_
+
+    if ($nregexes == SINGLE_REGEX) {
+        $src .= <<_EOC_;
+        MATCHED = 0,
+_EOC_
+    }
+
+    $src .= <<_EOC_;
     BUFSIZE = 4096
 };
 
@@ -1757,6 +1810,10 @@ _EOC_
     for my $c ('0' .. '9', 'A' .. 'Z', 'a' .. 'z', '_') {
         $src .= "    case '$c':\n";
     }
+
+    my $caller_nvec = max map { ($_ + 1) * 2 } @multi_ncaps;
+
+    #warn "caller nvec: $caller_nvec";
 
     $src .= <<_EOC_;
         return 1;
@@ -1776,7 +1833,7 @@ is_word_boundary(int a, int b)
 int
 main(void)
 {
-    int          i, rc, ovec[$nvec], global = $global, matches;
+    int          i, rc, ovec[$caller_nvec], global = $global, matches;
     char        *p, *buf;
     size_t       len, bufsize, rest;
     double       best = -1;
@@ -1861,7 +1918,7 @@ main(void)
             do {
                 rc = match((u_char *) p, rest, ovec);
 
-                if (rc > 0) {
+                if (rc >= 0) {
                     matches++;
                     p += ovec[1];
                     rest -= ovec[1];
@@ -1889,7 +1946,16 @@ main(void)
 
     } else {
         printf("match");
-        for (i = 0; i < $nvec; i += 2) {
+_EOC_
+
+    if ($nregexes != SINGLE_REGEX) {
+        $src .= <<_EOC_;
+        printf(" %d", (int) rc);
+_EOC_
+    }
+
+    $src .= <<_EOC_;
+        for (i = 0; i < $caller_nvec; i += 2) {
             printf(" (%d, %d)", ovec[i], ovec[i + 1]);
         }
     }
@@ -1914,8 +1980,12 @@ match(const u_char *const s, size_t len, int *const ovec)
 _EOC_
 
     {
-        for (my $i = 0; $i < $nvec; $i++) {
+        for (my $i = 0; $i < $caller_nvec; $i++) {
             $src .= "    int matched_$i = -1;\n";
+        }
+
+        if ($nregexes != SINGLE_REGEX) {
+            $src .= "    int matched_id;  /* (pending) matched regex ID */\n";
         }
     }
 
@@ -2173,7 +2243,7 @@ _EOC_
     if ($gen_read_char && @$edges) {
         if ($edges->[0]{to_accept}) {
             $src .= "    c = i < len ? s[i] : -1;\n    i++;\n";
-            $to_accept = 1;
+            $to_accept = $edges->[0]{target};
 
         } else {
             $src .= <<"_EOC_";
@@ -2204,7 +2274,7 @@ _EOC_
         $src .= $edge_src;
 
         if ($to_accept) {
-            $seen_accept = 1;
+            $seen_accept = $to_accept;
         }
 
         if ($to_accept && @$edges > 1) {
@@ -2252,15 +2322,35 @@ closing_state:
         $indent = '    ';
     }
 
-    for (my $i = 0; $i < $nvec; $i++) {
-        my $assign = "    ovec[$i] = matched_$i;";
-        $src .= $indent . "$assign\n";
-        if ($debug > 1) {
-            $src .= $indent . qq{    fprintf(stderr, "$assign\\n");\n};
+    my $ret;
+    if ($nregexes == SINGLE_REGEX) {
+        $ret = "MATCHED";
+    } else {
+        $ret = "matched_id";
+    }
+
+    {
+        my $caller_nvec = max map { ($_ + 1) * 2 } @multi_ncaps;
+
+        my ($from_vec_id, $to_vec_id);
+        if ($nregexes == SINGLE_REGEX) {
+            ($from_vec_id, $to_vec_id) = (0, $nvec);
+        } elsif ($seen_accept) {
+            ($from_vec_id, $to_vec_id) = @{ $seen_accept->{accept} };
+        } else {
+            ($from_vec_id, $to_vec_id) = (0, $caller_nvec);
+        }
+
+        for (my ($i, $j) = (0, $from_vec_id); $j < $to_vec_id; $i++, $j++) {
+            my $assign = "    ovec[$i] = matched_$i;";
+            $src .= $indent . "$assign\n";
+            if ($debug > 1) {
+                $src .= $indent . qq{    fprintf(stderr, "$assign\\n");\n};
+            }
         }
     }
 
-    $src .= $indent . "    return MATCHED;  /* fallback */\n";
+    $src .= $indent . "    return $ret;  /* fallback */\n";
 
     if (!$seen_accept) {
         $src .= <<'_EOC_';
@@ -2283,7 +2373,7 @@ sub gen_c_from_dfa_edge ($$$$$) {
 
     my $ranges = $edge->{char_ranges};
     my $target = $edge->{target};
-    my $to_accept = $edge->{to_accept};
+    my $to_accept = $edge->{to_accept} ? $target : undef;
     my $default_br = $edge->{default_branch};
 
     #warn "to accept: $to_accept";
@@ -2373,11 +2463,33 @@ sub gen_c_from_dfa_edge ($$$$$) {
             my $indent = $indents[$indent_idx];
             $src .= $indent . "if (asserts == $sibling_assert_settings) {\n";
 
-            for (my $i = 0; $i < $nvec; $i++) {
+            my ($ret, $accept_state);
+            if ($nregexes == SINGLE_REGEX) {
+                $ret = "MATCHED";
+            } else {
+                my $dfa_edges = $from_node->{edges};
+                my $edge = $dfa_edges->[0];
+                die unless $edge->{to_accept};
+                $accept_state = $edge->{target};
+                if (defined $accept_state->{assert_info}) {
+                    $accept_state = $accept_state->{edges}[0]{target};
+                }
+                $ret = "matched_id";
+            }
+
+            my ($from_vec_id, $to_vec_id);
+
+            if (defined $accept_state) {
+                ($from_vec_id, $to_vec_id) = @{ $accept_state->{accept} };
+            } else {
+                ($from_vec_id, $to_vec_id) = (0, $nvec);
+            }
+
+            for (my ($i, $j) = (0, $from_vec_id); $j < $to_vec_id; $i++, $j++) {
                 $src .= $indent . "    ovec[$i] = matched_$i;\n";
             }
 
-            $src .= $indent . "    return MATCHED;\n";
+            $src .= $indent . "    return $ret;\n";
             $src .= $indent . "}\n";
 
         } else {
@@ -2533,9 +2645,9 @@ sub gen_c_from_dfa_edge ($$$$$) {
             }
             $indent2 = $indent . (" " x 4);
             if ($target->{accept}) {
-                $to_accept = 1;
+                $to_accept = $target;
             }
-            $src .= gen_capture_handler_c_code($subedge, $target->{accept}, $indent2, $nvec);
+            $src .= gen_capture_handler_c_code($subedge, $to_accept, $indent2, $nvec);
             my $to = $target->{idx};
             if (!$to_accept) {
                 $src .= $indent2 . "goto st$to;\n";
@@ -2582,6 +2694,7 @@ sub gen_capture_handler_c_code ($$$$) {
     my $target = $edge->{target};
     my $mappings = $edge->{capture_mappings};
     my $nfa_edges = $edge->{nfa_edges};
+    my $vec_range = defined $to_accept ? $to_accept->{accept} : undef;
 
     my %echo_values;
     my (%to_save_rows, %overwritten, @stores, %to_be_stored);
@@ -2595,9 +2708,12 @@ sub gen_capture_handler_c_code ($$$$) {
             if ($bcname eq 'save') {
                 my $id = $bc->[1];
                 if ($to_accept) {
-                    push @stores, "matched_$id = i - 1;";
+                    #warn "save id: $id, caps range: @$vec_range";
+                    my $i = $id - $vec_range->[0];
+                    die if $i < 0;
+                    push @stores, "matched_$i = i - 1;";
                     if ($debug > 1) {
-                        $echo_values{"matched_$id"} = 1;
+                        $echo_values{"matched_$i"} = 1;
                     }
                 } else {
                     my $to_var = "caps${to_row}_$id";
@@ -2630,10 +2746,11 @@ sub gen_capture_handler_c_code ($$$$) {
 
         if ($to_accept) {
             my $t = $indent . "/* transfer caps from row $from_row to matched */\n";
-            for (my $i = 0; $i < $nvec; $i++) {
-                $t .= $indent . "matched_$i = caps${from_row}_$i;\n";
+            for (my $i = $vec_range->[0]; $i < $vec_range->[1]; $i++) {
+                my $id = $i - $vec_range->[0];
+                $t .= $indent . "matched_$id = caps${from_row}_$i;\n";
                 if ($debug > 1) {
-                    $echo_values{"matched_$i"} = 1;
+                    $echo_values{"matched_$id"} = 1;
                 }
             }
             push @transfers, $t;
@@ -2702,12 +2819,20 @@ sub gen_capture_handler_c_code ($$$$) {
         }
     }
 
+    if ($vec_range && $nregexes != SINGLE_REGEX) {
+        my $re_id = $vec_range->[2];
+        $src .= $indent . "matched_id = $re_id;\n";
+        if ($debug > 1) {
+            $src .= $indent . qq{fprintf(stderr, "\n${indent}matched_id = $re_id;\\n");\n};
+        }
+    }
+
     if (%echo_values) {
         if (@stores) {
             $src .= $indent . qq/fprintf(stderr, "\\n");/;
         }
         for my $var (sort keys %echo_values) {
-            $src .= $indent . qq/fprintf(stderr, "${indent}$var: %d\\n", $var);/;
+            $src .= $indent . qq/fprintf(stderr, "${indent}$var: %d\\n", $var);\n/;
         }
     }
 
@@ -2729,6 +2854,7 @@ Options:
     --debug=LEVEL   specify the debug output level; valid values are
                     0, 1, and 2.
 
+    --flags=FLAGS   specify extra regex flags like "i".
     -g              perform global search (similar to Perl's /g mode).
 
     --help          show this usage.
@@ -2873,4 +2999,34 @@ sub analyze_dfa ($) {
         #warn "removed $changes unreacheable nodes.\n";
         @$dfa_nodes = grep { defined } @$dfa_nodes;
     }
+}
+
+sub gen_ovec_id_range ($) {
+    my ($states) = @_;
+    my $pc;
+    for my $state (@$states) {
+        if (!defined $pc) {
+            $pc = $state;
+        } elsif ($pc != $state) {
+            die "$pc != $state, ", opcode($bytecodes[$pc]), " vs ",
+                opcode($bytecodes[$state]);
+        }
+    }
+
+    my $bc = $bytecodes[$pc];
+    die $bc if !ref $bc;
+    die if !defined $bc->[1];
+    die unless $bc->[0] eq 'match';
+    my $re_id = $bc->[1];
+
+    my $from_vec_id = 0;
+    my $to_vec_id;
+
+    for (my $i = 0; $i < $re_id; $i++) {
+        $from_vec_id += ($multi_ncaps[$i] + 1) * 2;
+    }
+    my $target_vec_count = ($multi_ncaps[$re_id] + 1) * 2;
+    $to_vec_id = $from_vec_id + $target_vec_count;
+
+    return $from_vec_id, $to_vec_id, $re_id;
 }

@@ -12,20 +12,20 @@ use Test::LongString;
 sub run_test ($);
 sub parse_res ($);
 sub fmt_cap ($$);
-sub parse_sregex_dfa_res ($$);
+sub parse_sregex_dfa_res ($$$);
 
 
 our @EXPORT = qw( run_tests );
 
 our $UseValgrind = $ENV{TEST_SREGEX_USE_VALGRIND};
 our $ForceMultiRegexes = $ENV{TEST_SREGEX_FORCE_MULTI_REGEXES};
+our $FakeRegex = '^章亦春$';
 
 sub run_tests {
     for my $block (blocks()) {
         run_test($block);
     }
 }
-
 
 sub run_test ($) {
     my $block = shift;
@@ -43,8 +43,10 @@ sub run_test ($) {
         die "No --- re specified for test $name\n";
     }
 
+    my $use_fake_regex;
     if (!ref $re && $ForceMultiRegexes) {
-        $re = ['^章亦春$', $re];
+        $re = [$FakeRegex, $re];
+        $use_fake_regex = 1;
     }
 
     my $flags = $block->flags;
@@ -55,7 +57,9 @@ sub run_test ($) {
     if ($flags) {
         $prefix = "(?$flags)";
         #warn "prefix: $prefix\n";
-        push @opts, "--flags", $flags;
+        if (!$use_fake_regex) {
+            push @opts, "--flags", $flags;
+        }
 
     } else {
         $prefix = "";
@@ -64,8 +68,8 @@ sub run_test ($) {
     if (ref $re) {
         push @opts, "-n", scalar @$re;
 
-        if ($flags && @$re == 2 && $re->[0] eq '^章亦春$') {
-            push @opts, "--flags", " $flags";
+        if ($flags && $use_fake_regex) {
+            push @opts, "--flags", "$flags $flags";
         }
     }
 
@@ -90,7 +94,7 @@ sub run_test ($) {
         $err =~ /\[error\] .*\n/;
         $err = $&;
 
-        if (ref $re && @$re == 2 && $re->[0] eq '^章亦春$') {
+        if (ref $re && @$re == 2 && $re->[0] eq $FakeRegex) {
             $err =~ s/regex \d+:\s+//;
         }
 
@@ -100,7 +104,7 @@ sub run_test ($) {
         $err =~ /\[error\] .*\n/;
         $err = $&;
 
-        if (ref $re && @$re == 2 && $re->[0] eq '^章亦春$') {
+        if (ref $re && @$re == 2 && $re->[0] eq $FakeRegex) {
             $err =~ s/regex \d+:\s+//;
         }
 
@@ -150,7 +154,9 @@ sub run_test ($) {
                 warn $res;
             }
 
-            if (ref $re && @$re == 2 && $re->[0] eq '^章亦春$') {
+            my $orig_re = $re;
+            if (ref $re && @$re == 2 && $re->[0] eq $FakeRegex) {
+                $orig_re = [@$re];
                 $re = pop @$re;
             }
 
@@ -240,16 +246,24 @@ sub run_test ($) {
                     is($splitted_pike_temp_cap, $block->temp_cap, "$name - splitted pike vm temporary capture ok");
                 }
 
-                if (!@opts) {
-                    my $res = parse_sregex_dfa_res($re, $stdin);
+                my ($res, $dfa_re_id) = parse_sregex_dfa_res($orig_re, \@opts, $stdin);
 
-                    if (defined $block->no_match) {
-                        is($res, 0, "$name - sregex dfa vm should not match");
-                    } else {
-                        isnt($res, 0, "$name - sregex dfa vm should match");
-                    }
+                if (defined $block->no_match) {
+                    ok(!$res, "$name - sregex dfa vm should not match");
+                } else {
+                    ok($res, "$name - sregex dfa vm should match");
+                }
 
+                if (ref $expected_cap) {
+                    like($res, $expected_cap, "$name - sregex dfa vm capture ok");
+                } else {
                     is($res, $expected_cap, "$name - sregex dfa vm capture ok");
+                }
+
+                if (defined $block->match_id) {
+                    is $dfa_re_id, $block->match_id, "$name - sregex dfa match id ok";
+                } elsif (ref $orig_re && $orig_re->[0] eq $FakeRegex) {
+                    is $dfa_re_id, 1, "$name - sregex dfa match id ok";
                 }
 
             } elsif ($s =~ m/$prefix$re/sm) {
@@ -281,16 +295,21 @@ sub run_test ($) {
                     is($splitted_pike_temp_cap, $block->temp_cap, "$name - splitted pike vm temporary capture ok");
                 }
 
-                if (!@opts) {
-                    my $res = parse_sregex_dfa_res($re, $stdin);
+                #warn "ref \$re: ", ref $re;
+                my ($res, $dfa_re_id) = parse_sregex_dfa_res($orig_re, \@opts, $stdin);
 
-                    if (defined $block->no_match) {
-                        is($res, 0, "$name - sregex dfa vm should not match");
-                    } else {
-                        isnt($res, 0, "$name - sregex dfa vm should match");
-                    }
+                if (defined $block->no_match) {
+                    ok(!$res, "$name - sregex dfa vm should not match");
+                } else {
+                    ok($res, "$name - sregex dfa vm should match");
+                }
 
-                    is($res, $expected_cap, "$name - sregex dfa vm capture ok");
+                is($res, $expected_cap, "$name - sregex dfa vm capture ok");
+
+                if (defined $block->match_id) {
+                    is $dfa_re_id, $block->match_id, "$name - sregex dfa match id ok";
+                } elsif (ref $orig_re && $orig_re->[0] eq $FakeRegex) {
+                    is $dfa_re_id, 1, "$name - sregex dfa match id ok";
                 }
 
             } else {
@@ -314,12 +333,12 @@ sub run_test ($) {
     }
 }
 
-sub parse_sregex_dfa_res ($$) {
-    my ($re, $data) = @_;
+sub parse_sregex_dfa_res ($$$) {
+    my ($re, $opts, $data) = @_;
     #warn "data: $data";
     my ($res, $err);
     #warn @opts;
-    my @cmd = ("./re.pl", "--debug=0", "--cc=tcc", "--stdin", $re);
+    my @cmd = ("./re.pl", "--debug=0", "--cc=tcc", "--stdin", @$opts, ref $re ? @$re : $re);
     #warn "command: @cmd";
 
     run3 \@cmd, \$data, \$res, \$err;
@@ -331,12 +350,13 @@ sub parse_sregex_dfa_res ($$) {
     my $last = pop @lines;
     #warn "last: $last";
     if ($last =~ /\bno match\b/) {
-        return 0;
+        return undef;
     }
-    if ($last =~ /\bmatch (\([^:]+)/) {
-        my $caps = $1;
+    if ($last =~ /\bmatch (?:(\d+) )?(\([^:]+)/) {
+        my $re_id = $1;
+        my $caps = $2;
         $caps =~ s/( \(-1, -1\))+$//g;
-        return $caps;
+        return $caps, $re_id;
     }
     #warn $res;
     #warn "Bad perl script output: $last";
