@@ -2052,6 +2052,10 @@ _EOC_
     }
 
     $src .= <<_EOC_;
+/*
+ * $func_name: the "ovec" array should be allocated by the caller with at
+ * least $caller_nvec elements.
+ */
 int
 $func_name(const u_char *const s, size_t len, int *const ovec)
 {
