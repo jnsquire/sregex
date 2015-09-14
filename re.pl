@@ -2055,8 +2055,8 @@ _EOC_
 int
 $func_name(const u_char *const s, size_t len, int *const ovec)
 {
-    int c;
-    int i = 0;
+    int      c;
+    unsigned i = 0;
 _EOC_
 
     {
