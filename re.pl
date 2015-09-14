@@ -115,24 +115,32 @@ sub dump_code ($);
 sub count_chars_and_holes_in_ranges ($);
 sub analyze_dfa ($);
 sub gen_ovec_id_range ($);
+sub compile_and_run ($);
 
 my $cc = "cc";
 my $debug = 0;
 
 GetOptions("help|h",        \(my $help),
            "cc=s",          \$cc,
+           "c",             \(my $compile_only),
            "flags=s",       \(my $flags),
+           "func-name=s",   \(my $func_name),
+           "no-main",       \(my $no_main),
            "repeat=i",      \(my $repeat),
            "debug=i",       \$debug,
            "g",             \(my $global),
            "n=i",           \(my $nregexes),
-           "out|o=s",       \(my $exefile),
+           "out|o=s",       \(my $outfile),
            "timer",         \(my $timer),
            "stdin",         \(my $stdin))
    or die usage(1);
 
 if ($help) {
     usage(0);
+}
+
+if (!defined $func_name) {
+    $func_name = "match";
 }
 
 if (!defined $nregexes) {
@@ -350,16 +358,24 @@ draw_dfa($dfa) if $debug;
 my $c = gen_c_from_dfa($dfa);
 warn dump_code($c) if $debug > 2;
 #$begin = time;
-{
+compile_and_run($c);
+
+sub compile_and_run ($) {
+    my ($c) = @_;
+
     my ($fh, $fname);
-    my $exe_tmp;
-    if (!defined $exefile) {
+    my $out_tmp;
+    if (!defined $outfile) {
         ($fh, $fname) = tempfile(SUFFIX => '.c', UNLINK => 1);
-        $exefile = tmpnam();
-        $exe_tmp = 1;
+        $outfile = tmpnam();
+        $out_tmp = 1;
     } else {
-        unlink $exefile if -f $exefile;
-        $fname = $exefile . ".c";
+        unlink $outfile if -f $outfile;
+        if ($compile_only || $no_main) {
+            $fname = $outfile;
+        } else {
+            $fname = $outfile . ".c";
+        }
         open $fh, ">$fname" or die "cannot open $fname for writing: $!\n";
     }
 
@@ -373,7 +389,14 @@ warn dump_code($c) if $debug > 2;
         $extra_ccopt = "-Wall -Wno-unused-label -Wno-unused-variable -Wno-unused-but-set-variable -Werror";
     }
 
-    my $cmd = "$cc -o $exefile $extra_ccopt $fname";
+    if ($no_main || $compile_only) {
+        $extra_ccopt .= " -c";
+
+    } else {
+        $extra_ccopt .= " -o $outfile";
+    }
+
+    my $cmd = "$cc $extra_ccopt $fname";
     #warn $cmd;
     system($cmd) == 0 or die "$!\n";
 
@@ -385,7 +408,9 @@ warn dump_code($c) if $debug > 2;
         #}
     #}
 
-    my $path = File::Spec->rel2abs($exefile);
+    return if $no_main || $compile_only;
+
+    my $path = File::Spec->rel2abs($outfile);
     my @cmd = ($path);
 
     #my $begin = time;
@@ -401,11 +426,11 @@ warn dump_code($c) if $debug > 2;
     }
 
     if ($rc != 0) {
-        die "failed to run the executable file $exefile: $rc\n";
+        die "failed to run the executable file $outfile: $rc\n";
     }
 
-    if ($exe_tmp) {
-        unlink $exefile or die $!;
+    if ($out_tmp) {
+        unlink $outfile or die $!;
     } else {
         #warn "file $exefile generated.\n";
     }
@@ -1761,15 +1786,33 @@ sub gen_c_from_dfa ($) {
     close $in;
 
     my $src = <<_EOC_;
+/* TODO: we should get rid of these compiler-specific progra eventually. */
+#pragma GCC diagnostic ignored "-Wunused-label"
+#pragma GCC diagnostic ignored "-Wunused-variable"
+#if __clang__
+#   pragma GCC diagnostic ignored "-Wunused-function"
+#else
+#   pragma GCC diagnostic ignored "-Wunused-but-set-variable"
+#endif
+
+
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <ctype.h>
 #include <errno.h>
-#include <time.h>
 #include <string.h>
+_EOC_
+
+    if (!$no_main) {
+        $src .= <<_EOC_;
+#include <time.h>
 
 $getcputime
+_EOC_
+    }
+
+    $src .= <<_EOC_;
 
 #if __GNUC__ > 3
 #    define likely(x)       __builtin_expect((x),1)
@@ -1788,16 +1831,21 @@ _EOC_
 
     if ($nregexes == SINGLE_REGEX) {
         $src .= <<_EOC_;
-        MATCHED = 0,
+    MATCHED = 0,
+_EOC_
+    }
+
+    if (!$no_main) {
+        $src .= <<_EOC_;
+    BUFSIZE = 4096
 _EOC_
     }
 
     $src .= <<_EOC_;
-    BUFSIZE = 4096
 };
 
 
-static int match(const u_char *const s, size_t len, int *const ovec);
+static int $func_name(const u_char *const s, size_t len, int *const ovec);
 
 
 static inline int
@@ -1830,6 +1878,10 @@ is_word_boundary(int a, int b)
 }
 
 
+_EOC_
+
+    if (!$no_main) {
+        $src .= <<_EOC_;
 int
 main(void)
 {
@@ -1916,7 +1968,7 @@ main(void)
             }
 
             do {
-                rc = match((u_char *) p, rest, ovec);
+                rc = $func_name((u_char *) p, rest, ovec);
 
                 if (rc >= 0) {
                     matches++;
@@ -1972,8 +2024,12 @@ _EOC_
 }
 
 
+_EOC_
+    }
+
+    $src .= <<_EOC_;
 static int
-match(const u_char *const s, size_t len, int *const ovec)
+$func_name(const u_char *const s, size_t len, int *const ovec)
 {
     int c;
     int i = 0;
@@ -2847,6 +2903,9 @@ Usage:
     re.pl [options] --stdin <regex> < input-file
 
 Options:
+    -c              compile only and do not link an executable from the
+                    output C program and run it automatically.
+
     --cc=NAME       specify the name of the C compiler used to compile
                     the generated C code for the regex. a full path
                     can be accepted too. default to "cc".
@@ -2855,10 +2914,15 @@ Options:
                     0, 1, and 2.
 
     --flags=FLAGS   specify extra regex flags like "i".
+
+    --func-name=NAME
+                    specify the C match function name (default to "match").
+
     -g              perform global search (similar to Perl's /g mode).
 
     --help          show this usage.
 
+    --no-main       exclude a C main function in the C output.
     --out=FILE      specify the output executable file generated by the
                     C compiler.
 
