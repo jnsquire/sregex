@@ -337,6 +337,7 @@ my $edge_attr =
 my %nfa_paths;
 my %pc2assert;
 my $used_asserts;
+my $used_word_asserts;
 
 #my $begin = time;
 my $nfa = gen_nfa();
@@ -478,6 +479,10 @@ sub gen_nfa () {
                 #warn "new assert $bc->[1]";
                 $pc2assert{$idx} = $bc->[1];
                 $found = 1;
+            }
+            my $assert = $bc->[1];
+            if (!$used_word_asserts && ($assert eq '\b' || $assert eq '\B')) {
+                $used_word_asserts = 1;
             }
         }
 
@@ -1800,6 +1805,7 @@ sub gen_c_from_dfa ($) {
 #   pragma GCC diagnostic ignored "-Wunused-but-set-variable"
 #endif
 
+
 _EOC_
 
     for my $header (@$c_headers) {
@@ -1815,6 +1821,8 @@ _EOC_
 #include <ctype.h>
 #include <errno.h>
 #include <string.h>
+
+
 _EOC_
 
     if (!$no_main) {
@@ -1822,11 +1830,11 @@ _EOC_
 #include <time.h>
 
 $getcputime
+
 _EOC_
     }
 
     $src .= <<_EOC_;
-
 #if __GNUC__ > 3
 #    define likely(x)       __builtin_expect((x),1)
 #    define unlikely(x)     __builtin_expect((x),0)
@@ -1835,7 +1843,10 @@ _EOC_
 #    define unlikely(x)    (x)
 #endif
 
+
+#ifndef u_char
 #define u_char          unsigned char
+#endif
 
 
 enum {
@@ -1861,13 +1872,15 @@ _EOC_
 _EOC_
 
     if (!$no_main) {
-        $src .= "static ";
+        $src .= <<_EOC_;
+static int $func_name(const u_char *const s, size_t len, int *const ovec);
+
+
+_EOC_
     }
 
-    $src .= <<_EOC_;
-int $func_name(const u_char *const s, size_t len, int *const ovec);
-
-
+    if ($used_word_asserts) {
+        $src .= <<_EOC_;
 static inline int
 is_word(int c)
 {
@@ -1875,15 +1888,11 @@ is_word(int c)
     switch (c) {
 _EOC_
 
-    for my $c ('0' .. '9', 'A' .. 'Z', 'a' .. 'z', '_') {
-        $src .= "    case '$c':\n";
-    }
+        for my $c ('0' .. '9', 'A' .. 'Z', 'a' .. 'z', '_') {
+            $src .= "    case '$c':\n";
+        }
 
-    my $caller_nvec = max map { ($_ + 1) * 2 } @multi_ncaps;
-
-    #warn "caller nvec: $caller_nvec";
-
-    $src .= <<_EOC_;
+        $src .= <<_EOC_;
         return 1;
     default:
         return 0;
@@ -1899,6 +1908,11 @@ is_word_boundary(int a, int b)
 
 
 _EOC_
+    }
+
+    my $caller_nvec = max map { ($_ + 1) * 2 } @multi_ncaps;
+
+    #warn "caller nvec: $caller_nvec";
 
     if (!$no_main) {
         $src .= <<_EOC_;
@@ -2069,7 +2083,7 @@ _EOC_
         }
 
         if ($nregexes != SINGLE_REGEX) {
-            $src .= "    int matched_id;  /* (pending) matched regex ID */\n";
+            $src .= "    int matched_id = NO_MATCH;  /* (pending) matched regex ID */\n";
         }
     }
 
