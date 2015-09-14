@@ -2419,7 +2419,7 @@ closing_state:
     $src .= "    }  /* end state */\n\n";
 
     if ($used_error) {
-        $src .= "st${idx}_error:\n";
+        $src .= "st${idx}_error:\n\n";
     }
 
     my $indent = '';
