@@ -125,6 +125,7 @@ GetOptions("help|h",        \(my $help),
            "c",             \(my $compile_only),
            "flags=s",       \(my $flags),
            "func-name=s",   \(my $func_name),
+           'header=s@',     \(my $c_headers),
            "no-main",       \(my $no_main),
            "repeat=i",      \(my $repeat),
            "debug=i",       \$debug,
@@ -182,23 +183,25 @@ for (my $i = 1; $i <= $nregexes; $i++) {
 }
 
 my $subject;
-if ($stdin) {
-    my $first = <STDIN>;
-    if ($first =~ s/^(\d+)$//s) {
-        my $len = $1;
-        if (!defined read(STDIN, $subject, $len)) {
-            die "failed to read stdin: $!\n";
+if (!$compile_only && !$no_main) {
+    if ($stdin) {
+        my $first = <STDIN>;
+        if ($first =~ s/^(\d+)$//s) {
+            my $len = $1;
+            if (!defined read(STDIN, $subject, $len)) {
+                die "failed to read stdin: $!\n";
+            }
+
+        } else {
+            die "the stdin output must come with a length prefix line but got: $first\n";
         }
 
     } else {
-        die "the stdin output must come with a length prefix line but got: $first\n";
-    }
-
-} else {
-    $subject = shift;
-    if (!defined $subject) {
-        warn "No subject nor --stdin specified.\n";
-        usage(1);
+        $subject = shift;
+        if (!defined $subject) {
+            warn "No subject nor --stdin specified.\n";
+            usage(1);
+        }
     }
 }
 
@@ -389,7 +392,9 @@ sub compile_and_run ($) {
         $extra_ccopt = "-Wall -Wno-unused-label -Wno-unused-variable -Wno-unused-but-set-variable -Werror";
     }
 
-    if ($no_main || $compile_only) {
+    return if $compile_only;
+
+    if ($no_main) {
         $extra_ccopt .= " -c";
 
     } else {
@@ -408,7 +413,7 @@ sub compile_and_run ($) {
         #}
     #}
 
-    return if $no_main || $compile_only;
+    return if $no_main;
 
     my $path = File::Spec->rel2abs($outfile);
     my @cmd = ($path);
@@ -1795,7 +1800,15 @@ sub gen_c_from_dfa ($) {
 #   pragma GCC diagnostic ignored "-Wunused-but-set-variable"
 #endif
 
+_EOC_
 
+    for my $header (@$c_headers) {
+        $src .= <<_EOC_;
+#include "$header"
+_EOC_
+    }
+
+    $src .= <<_EOC_;
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -1845,7 +1858,14 @@ _EOC_
 };
 
 
-static int $func_name(const u_char *const s, size_t len, int *const ovec);
+_EOC_
+
+    if (!$no_main) {
+        $src .= "static ";
+    }
+
+    $src .= <<_EOC_;
+int $func_name(const u_char *const s, size_t len, int *const ovec);
 
 
 static inline int
@@ -1949,8 +1969,8 @@ main(void)
         /* the "volatile" keyword is just to avoid the C compiler from
          * optimizing our useless loop away.
          */
-        size_t          rest;
-        volatile int    i;
+        size_t               rest;
+        volatile unsigned    i;
 
         for (i = 0; i < $repeat; i++) {
             double               elapsed, begin, end;
@@ -2027,8 +2047,12 @@ _EOC_
 _EOC_
     }
 
+    if (!$no_main) {
+        $src .= "static ";
+    }
+
     $src .= <<_EOC_;
-static int
+int
 $func_name(const u_char *const s, size_t len, int *const ovec)
 {
     int c;
@@ -2919,6 +2943,9 @@ Options:
                     specify the C match function name (default to "match").
 
     -g              perform global search (similar to Perl's /g mode).
+
+    --header=FILE   specify extra C header file to include (multiple instances
+                    of this option are supported).
 
     --help          show this usage.
 
