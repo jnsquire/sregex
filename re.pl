@@ -1738,7 +1738,7 @@ sub gen_dfa_node_label ($) {
     #}
     my @lines = "{" . join(",", uniq @{ $node->{states} }) . "}";
     push @lines, $node->{idx};
-    if ($debug == 2 && defined $node->{min_len}) {
+    if ($debug >= 2 && defined $node->{min_len}) {
         push @lines, "∧=$node->{min_len}";
     }
     return join "\\n", @lines;
@@ -1978,7 +1978,7 @@ main(void)
     } while (1);
 
     /*
-    if ($debug == 2) {
+    if ($debug >= 2) {
         fprintf(stderr, "input string: %.*s\\n", (int) len, buf);
     }
     */
@@ -2818,6 +2818,7 @@ sub gen_capture_handler_c_code ($$$$) {
                     my $i = $id - $vec_range->[0];
                     die if $i < 0;
                     push @stores, "matched_$i = i - 1;";
+                    $to_be_stored{"$to_row-$id"} = 1;
                     if ($debug > 1) {
                         $echo_values{"matched_$i"} = 1;
                     }
@@ -2853,10 +2854,12 @@ sub gen_capture_handler_c_code ($$$$) {
         if ($to_accept) {
             my $t = $indent . "/* transfer caps from row $from_row to matched */\n";
             for (my $i = $vec_range->[0]; $i < $vec_range->[1]; $i++) {
-                my $id = $i - $vec_range->[0];
-                $t .= $indent . "matched_$id = caps${from_row}_$i;\n";
-                if ($debug > 1) {
-                    $echo_values{"matched_$id"} = 1;
+                if (!$to_be_stored{"$to_row-$i"}) {
+                    my $id = $i - $vec_range->[0];
+                    $t .= $indent . "matched_$id = caps${from_row}_$i;\n";
+                    if ($debug > 1) {
+                        $echo_values{"matched_$id"} = 1;
+                    }
                 }
             }
             push @transfers, $t;
