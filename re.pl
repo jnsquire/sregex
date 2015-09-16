@@ -1658,7 +1658,7 @@ sub gen_dfa_node_label ($) {
     #}
     my @lines = "{" . join(",", uniq @{ $node->{states} }) . "}";
     push @lines, $node->{idx};
-    if ($debug == 2 && defined $node->{min_len}) {
+    if ($debug >= 2 && defined $node->{min_len}) {
         push @lines, "∧=$node->{min_len}";
     }
     return join "\\n", @lines;
@@ -1827,7 +1827,7 @@ main(void)
     } while (1);
 
     /*
-    if ($debug == 2) {
+    if ($debug >= 2) {
         fprintf(stderr, "input string: %.*s\\n", (int) len, buf);
     }
     */
