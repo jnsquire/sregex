@@ -83,6 +83,7 @@ use constant {
 };
 
 sub add_nfa_edges ($$$$);
+sub gen_nfa_node_label ($);
 sub gen_nfa_edge_label ($);
 sub escape_char ($);
 sub escape_range_char ($);
@@ -90,6 +91,7 @@ sub gen_nfa ();
 sub draw_nfa ($);
 sub bc_is_nfa_node ($);
 sub opcode ($);
+sub analyze_nfa ($);
 sub gen_dfa_edges ($$$$$$);
 sub gen_dfa ($);
 sub dedup_nfa_edges ($);
@@ -116,6 +118,9 @@ sub count_chars_and_holes_in_ranges ($);
 sub analyze_dfa ($);
 sub gen_ovec_id_range ($);
 sub compile_and_run ($);
+
+# optimization flags:
+my $UseConstPropagate = 1;
 
 my $cc = "cc";
 my $debug = 0;
@@ -344,6 +349,8 @@ my $nfa = gen_nfa();
 #my $elapsed = time - $begin;
 #warn "NFA generated ($elapsed sec).\n";
 #warn Dumper($nfa);
+analyze_nfa($nfa);
+
 warn scalar @{ $nfa->{nodes} }, " NFA nodes found.\n" if $debug;
 draw_nfa($nfa) if $debug;
 
@@ -512,13 +519,16 @@ sub gen_nfa () {
         $idx++;
     }
 
+    my %pc2node;
     for my $node (@nodes) {
         my %visited;
         my $idx = $node->{idx};
+        $pc2node{$idx} = $node;
         add_nfa_edges($node, $idx == 0 ? 0 : $idx + 1, \%visited, undef);
     }
 
     return {
+        pc2node => \%pc2node,
         nodes => \@nodes,
         nvec => sum map { ($_ + 1) * 2 } @multi_ncaps,
     }
@@ -551,7 +561,7 @@ sub draw_nfa ($) {
         my $idx = $node->{idx};
         $graph->add_node("n$idx", $node->{start} ? (color => 'orange') : (),
                          $node->{accept} ? (shape => 'doublecircle') : (),
-                         label => $big ? '' : $idx || " $idx");
+                         label => $big ? '' : gen_nfa_node_label($node));
     }
     for my $node (@$nfa_nodes) {
         my $from_idx = $node->{idx};
@@ -565,6 +575,17 @@ sub draw_nfa ($) {
         }
     }
     $graph->as_png("nfa.png");
+}
+
+sub gen_nfa_node_label ($) {
+    my ($node) = @_;
+    my $idx = $node->{idx};
+    my $label = ($idx || " $idx");
+    if ($debug >= 2 && defined $node->{vec}) {
+        my $vec = $node->{vec};
+        $label .= "\\n<" . join(",", @$vec) . ">";
+    }
+    return $label;
 }
 
 sub add_nfa_edges ($$$$) {
@@ -716,6 +737,87 @@ sub escape_range_char ($) {
         return $c;
     }
     return sprintf("\\\\x%02x", ord($c));
+}
+
+sub analyze_nfa ($) {
+    my ($nfa) = @_;
+
+    my $nfa_nodes = $nfa->{nodes};
+    my $pc2node = $nfa->{pc2node};
+    my $nvec = $nfa->{nvec};
+
+    if ($UseConstPropagate) {
+        # propagate the initial value -1 for submatch capture fields across
+        # the NFA in the forward direction. 3 values are used for the "value"
+        # field of each NFA node: undef (uninitialized), -1, and "x" (means
+        # uncertain).
+
+        for my $node (@$nfa_nodes) {
+            my $vec = [];
+            $node->{vec} = $vec;
+            if ($node->{start}) {
+                for (my $i = 0; $i < $nvec; $i++) {
+                    $vec->[$i] = -1;
+                }
+            } else {
+                # leave each vector field undef as the initial value.
+            }
+        }
+
+        my $nvec = $nfa->{nvec};
+        my $changes;
+        do {{
+            $changes = 0;
+            for my $node (@$nfa_nodes) {
+                my $fr_vec = $node->{vec};
+                for my $e (@{ $node->{edges} }) {
+                    # FIXME we really should cache the assigned table in the
+                    # NFA edge.
+                    my %assigned;
+                    for my $pc (@$e) {
+                        my $bc = $bytecodes[$pc];
+                        my $opcode = opcode($bc);
+                        if ($opcode eq 'save') {
+                            my $field = $bc->[1];
+                            $assigned{$field} = 1;
+                        }
+                    }
+
+                    my $to_pc = $e->[-1];
+                    my $target = $pc2node->{$to_pc};
+                    my $to_vec = $target->{vec};
+
+                    for (my $i = 0; $i < $nvec; $i++) {
+                        if ($assigned{$i}) {
+                            # propagate 'x' to the target field (even if it has
+                            # the value -1 already).
+                            my $v = $to_vec->[$i];
+                            if (!defined $v || $v ne 'x') {
+                                $changes++;
+                            }
+                            $to_vec->[$i] = 'x';
+                        } else {
+                            my $v0 = $fr_vec->[$i];
+                            my $v1 = $to_vec->[$i];
+                            if (!defined $v0) {
+                                # do nothing with an uninitialized value
+                            } elsif ($v0 eq '-1') {
+                                if (!defined $v1) {
+                                    $changes++;
+                                    $to_vec->[$i] = -1;
+                                }
+                            } elsif ($v0 eq 'x') {
+                                if (!defined $v1 || $v1 eq '-1') {
+                                    $changes++;
+                                    $to_vec->[$i] = 'x';
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }} while ($changes > 0);
+    }
 }
 
 sub gen_dfa ($) {
@@ -877,7 +979,7 @@ sub calc_capture_mapping ($$) {
             my $key = "$src_state-$to_pc";
             if (!$assigned{$to_row} && $nfa_paths{$key}) {
                 #warn "  mapping: $from_row => $to_row\n";
-                push @mappings, [$from_row, $to_row];
+                push @mappings, [$from_row, $to_row, $src_state, $nfa_edge->[-1]];
                 $assigned{$to_row} = 1;
             }
             $to_row++;
@@ -2801,11 +2903,12 @@ sub gen_capture_handler_c_code ($$$$) {
     my $mappings = $edge->{capture_mappings};
     my $nfa_edges = $edge->{nfa_edges};
     my $vec_range = defined $to_accept ? $to_accept->{accept} : undef;
+    my $pc2node = $nfa->{pc2node};
 
     my %echo_values;
     my (%to_save_rows, %overwritten, @stores, %to_be_stored);
     for my $mapping (@$mappings) {
-        my ($from_row, $to_row) = @$mapping;
+        my ($from_row, $to_row, $from_pc, $to_pc) = @$mapping;
 
         my $nfa_edge = $nfa_edges->[$to_row];
         for my $pc (@$nfa_edge) {
@@ -2830,12 +2933,19 @@ sub gen_capture_handler_c_code ($$$$) {
                         $echo_values{$to_var} = 1;
                     }
                 }
-            } elsif ($bcname eq 'assert') {
-                #warn "TODO: assertions";
             }
         }
 
         if (!$to_accept && $from_row != $to_row) {
+            my $from_nfa_node = $pc2node->{$from_pc};
+            my $from_const_vec = $from_nfa_node->{vec};
+
+            for my $i (@{ $from_const_vec }) {
+                # we abuse the %to_be_store hash table here for constant
+                # vector fields:
+                $to_be_stored{"$from_row-$i"} = 1;
+            }
+
             if ($overwritten{$from_row}) {
                 $to_save_rows{$from_row} = 1;
             }
@@ -2849,14 +2959,23 @@ sub gen_capture_handler_c_code ($$$$) {
 
     my @transfers;
     for my $mapping (@$mappings) {
-        my ($from_row, $to_row) = @$mapping;
+        my ($from_row, $to_row, $from_pc, $to_pc) = @$mapping;
 
         if ($to_accept) {
+            my $from_nfa_node = $pc2node->{$from_pc};
+            my $from_const_vec = $from_nfa_node->{vec};
             my $t = $indent . "/* transfer caps from row $from_row to matched */\n";
             for (my $i = $vec_range->[0]; $i < $vec_range->[1]; $i++) {
                 if (!$to_be_stored{"$to_row-$i"}) {
                     my $id = $i - $vec_range->[0];
-                    $t .= $indent . "matched_$id = caps${from_row}_$i;\n";
+                    my $from_var;
+                    if ($from_const_vec->[$i] eq '-1') {
+                        #warn "HIT";
+                        $from_var = '-1';
+                    } else {
+                        $from_var = "caps${from_row}_$i";
+                    }
+                    $t .= $indent . "matched_$id = $from_var;\n";
                     if ($debug > 1) {
                         $echo_values{"matched_$id"} = 1;
                     }
@@ -2865,6 +2984,8 @@ sub gen_capture_handler_c_code ($$$$) {
             push @transfers, $t;
 
         } elsif ($from_row != $to_row) {
+            my $from_nfa_node = $pc2node->{$from_pc};
+            my $from_const_vec = $from_nfa_node->{vec};
             my $t = $indent . "/* transfer caps from row $from_row to row $to_row */\n";
             for (my $i = 0; $i < $nvec; $i++) {
                 if (!$to_be_stored{"$to_row-$i"}) {
@@ -2873,7 +2994,9 @@ sub gen_capture_handler_c_code ($$$$) {
                         $t .= $indent . "tmp${to_row}_$i = $to_var;\n";
                     }
                     my $from_var;
-                    if ($overwritten{$from_row} && !$to_be_stored{"$from_row-$i"}) {
+                    if ($from_const_vec->[$i] eq '-1') {
+                        $from_var = '-1';
+                    } elsif ($overwritten{$from_row} && !$to_be_stored{"$from_row-$i"}) {
                         $from_var = "tmp${from_row}_$i";
                     } else {
                         $from_var = "caps${from_row}_$i";
