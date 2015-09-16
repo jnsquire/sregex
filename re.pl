@@ -2596,6 +2596,7 @@ sub gen_capture_handler_c_code ($$$$) {
                 my $id = $bc->[1];
                 if ($to_accept) {
                     push @stores, "matched_$id = i - 1;";
+                    $to_be_stored{"$to_row-$id"} = 1;
                     if ($debug > 1) {
                         $echo_values{"matched_$id"} = 1;
                     }
@@ -2631,9 +2632,11 @@ sub gen_capture_handler_c_code ($$$$) {
         if ($to_accept) {
             my $t = $indent . "/* transfer caps from row $from_row to matched */\n";
             for (my $i = 0; $i < $nvec; $i++) {
-                $t .= $indent . "matched_$i = caps${from_row}_$i;\n";
-                if ($debug > 1) {
-                    $echo_values{"matched_$i"} = 1;
+                if (!$to_be_stored{"$to_row-$i"}) {
+                    $t .= $indent . "matched_$i = caps${from_row}_$i;\n";
+                    if ($debug > 1) {
+                        $echo_values{"matched_$i"} = 1;
+                    }
                 }
             }
             push @transfers, $t;
