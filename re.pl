@@ -589,7 +589,7 @@ sub gen_nfa_node_label ($) {
 }
 
 sub add_nfa_edges ($$$$) {
-    my ($from_node, $idx, $visited, $to_nodes) = @_;
+    my ($from_node, $idx, $visited, $edge_pc_list) = @_;
 
     #warn "add edges: $from_node->{idx} => $idx";
     my $bc = $bytecodes[$idx];
@@ -600,7 +600,7 @@ sub add_nfa_edges ($$$$) {
         if ($opcode eq 'split') {
             my $y = $bc->[2];
             if (!$visited->{$y}) {
-                local @_ = ($from_node, $y, $visited, $to_nodes);
+                local @_ = ($from_node, $y, $visited, $edge_pc_list);
                 goto \&add_nfa_edges;
             }
         }
@@ -610,40 +610,43 @@ sub add_nfa_edges ($$$$) {
     $visited->{$idx} = 1;
 
     if ($opcode eq 'jmp') {
-        local @_ = ($from_node, $bc->[1], $visited, $to_nodes);
+        local @_ = ($from_node, $bc->[1], $visited, $edge_pc_list);
         goto \&add_nfa_edges;
     }
 
     if ($opcode eq 'split') {
         my $x = $bc->[1];
         my $y = $bc->[2];
-        my $forked = $to_nodes ? [@$to_nodes] : undef;
+        my $forked = $edge_pc_list ? [@$edge_pc_list] : undef;
         # we must fork the visited hash table to allow parallel edges with different assertions.
         my %visited_fork = %$visited;
-        add_nfa_edges($from_node, $x, \%visited_fork, $to_nodes);
-        #add_nfa_edges($from_node, $x, $visited, $to_nodes);
+        add_nfa_edges($from_node, $x, \%visited_fork, $edge_pc_list);
+        #add_nfa_edges($from_node, $x, $visited, $edge_pc_list);
         local @_ = ($from_node, $y, $visited, $forked);
         goto \&add_nfa_edges;
     }
 
     if ($opcode eq 'save' or $opcode eq 'assert') {
         #warn Dumper \$bc;
-        if (!defined $to_nodes) {
-            $to_nodes = [];
+        if (!defined $edge_pc_list) {
+            $edge_pc_list = [];
         }
-        push @$to_nodes, $idx;
-        local @_ = ($from_node, $idx + 1, $visited, $to_nodes);
+        push @$edge_pc_list, $idx;
+        local @_ = ($from_node, $idx + 1, $visited, $edge_pc_list);
         goto \&add_nfa_edges;
     }
 
-    if (!defined $to_nodes) {
-        $to_nodes = [];
+    if (!defined $edge_pc_list) {
+        $edge_pc_list = [];
     }
-    push @$to_nodes, $idx;
 
-    my $edge = $to_nodes;
+    my $edge = {
+        edge_pc_list => $edge_pc_list,
+        target_pc => $idx,
+    };
+
     {
-        my $key = $from_node->{idx} . "-" . $edge->[0];
+        my $key = $from_node->{idx} . "-" . ($edge_pc_list->[0] // $idx);
         #warn $key;
         $nfa_paths{$key} = 1;
     }
@@ -773,22 +776,27 @@ sub analyze_nfa ($) {
                 for my $e (@{ $node->{edges} }) {
                     # FIXME we really should cache the assigned table in the
                     # NFA edge.
-                    my %assigned;
-                    for my $pc (@$e) {
-                        my $bc = $bytecodes[$pc];
-                        my $opcode = opcode($bc);
-                        if ($opcode eq 'save') {
-                            my $field = $bc->[1];
-                            $assigned{$field} = 1;
+                    my $overwritten = $e->{overwritten};
+                    if (!defined $overwritten) {
+                        $overwritten = {};
+                        $e->{overwritten} = $overwritten;
+                        my $edge_pc_list = $e->{edge_pc_list};
+                        for my $pc (@$edge_pc_list) {
+                            my $bc = $bytecodes[$pc];
+                            my $opcode = opcode($bc);
+                            if ($opcode eq 'save') {
+                                my $field = $bc->[1];
+                                $overwritten->{$field} = 1;
+                            }
                         }
                     }
 
-                    my $to_pc = $e->[-1];
+                    my $to_pc = $e->{target_pc};
                     my $target = $pc2node->{$to_pc};
                     my $to_vec = $target->{vec};
 
                     for (my $i = 0; $i < $nvec; $i++) {
-                        if ($assigned{$i}) {
+                        if ($overwritten->{$i}) {
                             # propagate 'x' to the target field (even if it has
                             # the value -1 already).
                             my $v = $to_vec->[$i];
@@ -975,11 +983,11 @@ sub calc_capture_mapping ($$) {
     for my $src_state (@$src_states) {
         my $to_row = 0;
         for my $nfa_edge (@$nfa_edges) {
-            my $to_pc = $nfa_edge->[0];
+            my $to_pc = $nfa_edge->{edge_pc_list}[0] // $nfa_edge->{target_pc};
             my $key = "$src_state-$to_pc";
             if (!$assigned{$to_row} && $nfa_paths{$key}) {
                 #warn "  mapping: $from_row => $to_row\n";
-                push @mappings, [$from_row, $to_row, $src_state, $nfa_edge->[-1]];
+                push @mappings, [$from_row, $to_row, $src_state, $nfa_edge->{target_pc}];
                 $assigned{$to_row} = 1;
             }
             $to_row++;
@@ -1059,7 +1067,7 @@ sub gen_dfa_edges ($$$$$$) {
             $shadowed_nfa_edges{$nfa_edge} = 1;
         }
 
-        my $to = $nfa_edge->[-1];
+        my $to = $nfa_edge->{target_pc};
         my $bc = $bytecodes[$to];
         my $opcode = opcode($bc);
         #warn "opcode: $opcode";
@@ -1112,7 +1120,7 @@ sub gen_dfa_edges ($$$$$$) {
             #warn "Found match: @$nfa_edge";
             push @accept_edges, $nfa_edge;
             my $found_asserts;
-            for my $pc (@$nfa_edge) {
+            for my $pc (@{ $nfa_edge->{edge_pc_list} }) {
                 if ($pc2assert{$pc}) {
                     $found_asserts = 1;
                     last;
@@ -1292,7 +1300,7 @@ sub resolve_dfa_edge ($$$$$$$$) {
 
     my @states;
     for my $nfa_edge (@$nfa_edges) {
-        push @states, $nfa_edge->[-1];
+        push @states, $nfa_edge->{target_pc};
     }
 
     my ($key, $target_dfa_node);
@@ -1329,7 +1337,7 @@ sub resolve_dfa_edge ($$$$$$$$) {
     if (!defined $assert_info) {
         $nfa_nodes = [];
         for my $nfa_edge (@$nfa_edges) {
-            my $nfa_idx = $nfa_edge->[-1];
+            my $nfa_idx = $nfa_edge->{target_pc};
             my $nfa_node = first { $_->{idx} eq $nfa_idx } @{ $nfa->{nodes} };
             push @$nfa_nodes, $nfa_node;
         }
@@ -1422,7 +1430,7 @@ sub resolve_asserts ($) {
     for my $nfa_edge (@$nfa_edges) {
         my $found;
         my $mask = 0;
-        for my $pc (@$nfa_edge) {
+        for my $pc (@{ $nfa_edge->{edge_pc_list} }) {
             my $assert = $pc2assert{$pc};
             next unless defined $assert;
             $found = 1;
@@ -1535,7 +1543,7 @@ sub dedup_nfa_edges ($) {
     my %visited;
     my @ret;
     for my $e (@$nfa_edges) {
-        my $last = $e->[-1];
+        my $last = $e->{target_pc};
         if ($visited{$last}) {
             next;
         }
@@ -2911,7 +2919,8 @@ sub gen_capture_handler_c_code ($$$$) {
         my ($from_row, $to_row, $from_pc, $to_pc) = @$mapping;
 
         my $nfa_edge = $nfa_edges->[$to_row];
-        for my $pc (@$nfa_edge) {
+        for my $pc (@{ $nfa_edge->{edge_pc_list} }) {
+            # TODO: we could use the $nfa_edge->{overwritten} here
             my $bc = $bytecodes[$pc];
             my $bcname = opcode($bc);
             if ($bcname eq 'save') {
