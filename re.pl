@@ -568,7 +568,7 @@ sub draw_nfa ($) {
         my $e_idx = 0;
         for my $e (@{ $node->{edges} }) {
             my $label = gen_nfa_edge_label($e);
-            my $to_idx = $e->[-1];
+            my $to_idx = $e->{target_pc};
             my $color = $edge_colors[$e_idx] || 'black';
             $graph->add_edge("n$from_idx" => "n$to_idx", label => $label, color => $color, len => 1.6);
             $e_idx++;
@@ -670,7 +670,7 @@ sub bc_is_nfa_node ($) {
 sub gen_nfa_edge_label ($) {
     my ($e) = @_;
     my @labels;
-    for my $idx (@$e) {
+    for my $idx (@{ $e->{edge_pc_list} }, $e->{target_pc}) {
         my $bc = $bytecodes[$idx];
         my $opcode = opcode($bc);
         my $label = $cached_labels{$bc};
@@ -825,6 +825,30 @@ sub analyze_nfa ($) {
                 }
             }
         }} while ($changes > 0);
+
+        for my $node (@$nfa_nodes) {
+            #next if $node->{accept};
+            my $fr_vec = $node->{vec};
+            for (my $i = 0; $i < $nvec; $i++) {
+                next unless $fr_vec->[$i] eq '-1';
+                my $found_bad;  # found offender
+                for my $e (@{ $node->{edges} }) {
+                    my $to_pc = $e->{target_pc};
+                    my $target = $pc2node->{$to_pc};
+                    my $to_vec = $target->{vec};
+                    my $fld = $to_vec->[$i];
+                    if ($fld ne '-1' && !$e->{overwritten}{$i}) {
+                        $found_bad = 1;
+                        last;
+                    }
+                }
+                if (!$found_bad) {
+                    # safe to kill the field $i in the source NFA node.
+                    #warn "NFA node $node->{idx}: can kill vector field $i";
+                    $node->{"can_kill_$i"} = 1;
+                }
+            }
+        }
     }
 }
 
@@ -2995,6 +3019,7 @@ sub gen_capture_handler_c_code ($$$$) {
         } elsif ($from_row != $to_row) {
             my $from_nfa_node = $pc2node->{$from_pc};
             my $from_const_vec = $from_nfa_node->{vec};
+            my $to_nfa_node = $pc2node->{$to_pc};
             my $t = $indent . "/* transfer caps from row $from_row to row $to_row */\n";
             for (my $i = 0; $i < $nvec; $i++) {
                 if (!$to_be_stored{"$to_row-$i"}) {
@@ -3010,7 +3035,9 @@ sub gen_capture_handler_c_code ($$$$) {
                     } else {
                         $from_var = "caps${from_row}_$i";
                     }
-                    $t .= $indent . "$to_var = $from_var;\n";
+                    if (!$to_nfa_node->{"can_kill_$i"}) {
+                        $t .= $indent . "$to_var = $from_var;\n";
+                    }
                     if ($debug > 1) {
                         $echo_values{$to_var} = 1;
                     }
@@ -3019,7 +3046,6 @@ sub gen_capture_handler_c_code ($$$$) {
             $overwritten{$to_row} = 1;
             push @transfers, $t;
         }
-
     }
 
     if (@transfers) {
@@ -3064,7 +3090,7 @@ sub gen_capture_handler_c_code ($$$$) {
         my $re_id = $vec_range->[2];
         $src .= $indent . "matched_id = $re_id;\n";
         if ($debug > 1) {
-            $src .= $indent . qq{fprintf(stderr, "\n${indent}matched_id = $re_id;\\n");\n};
+            $src .= $indent . qq{fprintf(stderr, "\\n${indent}matched_id = $re_id;\\n");\n};
         }
     }
 
