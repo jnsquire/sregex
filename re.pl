@@ -119,9 +119,6 @@ sub analyze_dfa ($);
 sub gen_ovec_id_range ($);
 sub compile_and_run ($);
 
-# optimization flags:
-my $UseConstPropagate = 1;
-
 my $cc = "cc";
 my $debug = 0;
 
@@ -749,104 +746,101 @@ sub analyze_nfa ($) {
     my $pc2node = $nfa->{pc2node};
     my $nvec = $nfa->{nvec};
 
-    if ($UseConstPropagate) {
-        # propagate the initial value -1 for submatch capture fields across
-        # the NFA in the forward direction. 3 values are used for the "value"
-        # field of each NFA node: undef (uninitialized), -1, and "x" (means
-        # uncertain).
+    # propagate the initial value -1 for submatch capture fields across
+    # the NFA in the forward direction. 3 values are used for the "value"
+    # field of each NFA node: undef (uninitialized), -1, and "x" (means
+    # uncertain).
 
+    for my $node (@$nfa_nodes) {
+        my $vec = [];
+        $node->{vec} = $vec;
+        if ($node->{start}) {
+            for (my $i = 0; $i < $nvec; $i++) {
+                $vec->[$i] = -1;
+            }
+        } else {
+            # leave each vector field undef as the initial value.
+        }
+    }
+
+    my $changes;
+    do {{
+        $changes = 0;
         for my $node (@$nfa_nodes) {
-            my $vec = [];
-            $node->{vec} = $vec;
-            if ($node->{start}) {
-                for (my $i = 0; $i < $nvec; $i++) {
-                    $vec->[$i] = -1;
+            my $fr_vec = $node->{vec};
+            for my $e (@{ $node->{edges} }) {
+                # FIXME we really should cache the assigned table in the
+                # NFA edge.
+                my $overwritten = $e->{overwritten};
+                if (!defined $overwritten) {
+                    $overwritten = {};
+                    $e->{overwritten} = $overwritten;
+                    my $edge_pc_list = $e->{edge_pc_list};
+                    for my $pc (@$edge_pc_list) {
+                        my $bc = $bytecodes[$pc];
+                        my $opcode = opcode($bc);
+                        if ($opcode eq 'save') {
+                            my $field = $bc->[1];
+                            $overwritten->{$field} = 1;
+                        }
+                    }
                 }
-            } else {
-                # leave each vector field undef as the initial value.
+
+                my $to_pc = $e->{target_pc};
+                my $target = $pc2node->{$to_pc};
+                my $to_vec = $target->{vec};
+
+                for (my $i = 0; $i < $nvec; $i++) {
+                    if ($overwritten->{$i}) {
+                        # propagate 'x' to the target field (even if it has
+                        # the value -1 already).
+                        my $v = $to_vec->[$i];
+                        if (!defined $v || $v ne 'x') {
+                            $changes++;
+                        }
+                        $to_vec->[$i] = 'x';
+                    } else {
+                        my $v0 = $fr_vec->[$i];
+                        my $v1 = $to_vec->[$i];
+                        if (!defined $v0) {
+                            # do nothing with an uninitialized value
+                        } elsif ($v0 eq '-1') {
+                            if (!defined $v1) {
+                                $changes++;
+                                $to_vec->[$i] = -1;
+                            }
+                        } elsif ($v0 eq 'x') {
+                            if (!defined $v1 || $v1 eq '-1') {
+                                $changes++;
+                                $to_vec->[$i] = 'x';
+                            }
+                        }
+                    }
+                }
             }
         }
+    }} while ($changes > 0);
 
-        my $nvec = $nfa->{nvec};
-        my $changes;
-        do {{
-            $changes = 0;
-            for my $node (@$nfa_nodes) {
-                my $fr_vec = $node->{vec};
-                for my $e (@{ $node->{edges} }) {
-                    # FIXME we really should cache the assigned table in the
-                    # NFA edge.
-                    my $overwritten = $e->{overwritten};
-                    if (!defined $overwritten) {
-                        $overwritten = {};
-                        $e->{overwritten} = $overwritten;
-                        my $edge_pc_list = $e->{edge_pc_list};
-                        for my $pc (@$edge_pc_list) {
-                            my $bc = $bytecodes[$pc];
-                            my $opcode = opcode($bc);
-                            if ($opcode eq 'save') {
-                                my $field = $bc->[1];
-                                $overwritten->{$field} = 1;
-                            }
-                        }
-                    }
-
-                    my $to_pc = $e->{target_pc};
-                    my $target = $pc2node->{$to_pc};
-                    my $to_vec = $target->{vec};
-
-                    for (my $i = 0; $i < $nvec; $i++) {
-                        if ($overwritten->{$i}) {
-                            # propagate 'x' to the target field (even if it has
-                            # the value -1 already).
-                            my $v = $to_vec->[$i];
-                            if (!defined $v || $v ne 'x') {
-                                $changes++;
-                            }
-                            $to_vec->[$i] = 'x';
-                        } else {
-                            my $v0 = $fr_vec->[$i];
-                            my $v1 = $to_vec->[$i];
-                            if (!defined $v0) {
-                                # do nothing with an uninitialized value
-                            } elsif ($v0 eq '-1') {
-                                if (!defined $v1) {
-                                    $changes++;
-                                    $to_vec->[$i] = -1;
-                                }
-                            } elsif ($v0 eq 'x') {
-                                if (!defined $v1 || $v1 eq '-1') {
-                                    $changes++;
-                                    $to_vec->[$i] = 'x';
-                                }
-                            }
-                        }
-                    }
+    for my $node (@$nfa_nodes) {
+        #next if $node->{accept};
+        my $fr_vec = $node->{vec};
+        for (my $i = 0; $i < $nvec; $i++) {
+            next unless $fr_vec->[$i] eq '-1';
+            my $found_bad;  # found offender
+            for my $e (@{ $node->{edges} }) {
+                my $to_pc = $e->{target_pc};
+                my $target = $pc2node->{$to_pc};
+                my $to_vec = $target->{vec};
+                my $fld = $to_vec->[$i];
+                if ($fld ne '-1' && !$e->{overwritten}{$i}) {
+                    $found_bad = 1;
+                    last;
                 }
             }
-        }} while ($changes > 0);
-
-        for my $node (@$nfa_nodes) {
-            #next if $node->{accept};
-            my $fr_vec = $node->{vec};
-            for (my $i = 0; $i < $nvec; $i++) {
-                next unless $fr_vec->[$i] eq '-1';
-                my $found_bad;  # found offender
-                for my $e (@{ $node->{edges} }) {
-                    my $to_pc = $e->{target_pc};
-                    my $target = $pc2node->{$to_pc};
-                    my $to_vec = $target->{vec};
-                    my $fld = $to_vec->[$i];
-                    if ($fld ne '-1' && !$e->{overwritten}{$i}) {
-                        $found_bad = 1;
-                        last;
-                    }
-                }
-                if (!$found_bad) {
-                    # safe to kill the field $i in the source NFA node.
-                    #warn "NFA node $node->{idx}: can kill vector field $i";
-                    $node->{"can_kill_$i"} = 1;
-                }
+            if (!$found_bad) {
+                # safe to kill the field $i in the source NFA node.
+                #warn "NFA node $node->{idx}: can kill vector field $i";
+                $node->{"can_kill_$i"} = 1;
             }
         }
     }
