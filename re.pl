@@ -112,7 +112,7 @@ sub resolve_dfa_edge ($$$$$$$$);
 sub gen_dfa_edges_for_asserts ($$$$$$);
 sub gen_capture_handler_c_code ($$$$);
 sub gen_c_from_dfa_edge ($$$$$);
-sub gen_c_from_dfa_node ($$);
+sub gen_c_from_dfa_node ($$$);
 sub dump_code ($);
 sub count_chars_and_holes_in_ranges ($);
 sub analyze_dfa ($);
@@ -2241,19 +2241,29 @@ _EOC_
         }
     }
 
+    my %err_labels;
+
     for my $node (@$dfa_nodes) {
         next if defined $node->{assert_info} || $node->{accept};
-        $src .= gen_c_from_dfa_node($node, $nvec);
+        $src .= gen_c_from_dfa_node($node, $nvec, \%err_labels);
     }
 
-    $src .= <<"_EOC_";
-}
-_EOC_
+    # generate error states for the corresponding DFA states
+    for my $err_src (sort keys %err_labels) {
+        $src .= "\n";
+        my $labels = $err_labels{$err_src};
+        for my $label (@$labels) {
+            $src .= "$label:\n";
+        }
+        $src .= "\n$err_src";
+    }
+
+    $src .= "}\n";
     return $src;
 }
 
-sub gen_c_from_dfa_node ($$) {
-    my ($node, $nvec) = @_;
+sub gen_c_from_dfa_node ($$$) {
+    my ($node, $nvec, $err_labels) = @_;
     my $idx = $node->{idx};
 
     my $level = 1;
@@ -2273,6 +2283,7 @@ sub gen_c_from_dfa_node ($$) {
     $src .= qq{    fprintf(stderr, "* entering state $label (i=%d len=%d)\\n", i, (int) len);\n} if $debug;
 
     my $used_error;
+    my $err_label = "st${idx}_error";
 
     if (@$edges == 2) {
         # try to apply memchr optimization
@@ -2301,7 +2312,7 @@ sub gen_c_from_dfa_node ($$) {
         p = (const u_char *) memchr(s + i, $chr, len - i);
         if (unlikely(p == NULL)) {
             i = len;
-            goto st${idx}_error;
+            goto $err_label;
         }
 
         i = p - s;
@@ -2427,7 +2438,7 @@ _EOC_
         }
 
         if (unlikely(i == len)) {
-            goto st${idx}_error;
+            goto $err_label;
         }
     }
 
@@ -2483,7 +2494,7 @@ _EOC_
             $src .= <<"_EOC_";
     if (unlikely(i >= len)) {
         i++;
-        goto st${idx}_error;
+        goto $err_label;
     }
 
     c = s[i++];
@@ -2544,15 +2555,16 @@ _EOC_
 
 closing_state:
 
-    $src .= "    }  /* end state */\n\n";
+    $src .= <<_EOC_;
+    }  /* end state */
 
-    if ($used_error) {
-        $src .= "st${idx}_error:\n\n";
-    }
+_EOC_
+
+    my $err_src = "";
 
     my $indent = '';
     if (!$seen_accept) {
-        $src .= "    if (matched_0 != -1) {\n";
+        $err_src .= "    if (matched_0 != -1) {\n";
         $indent = '    ';
     }
 
@@ -2577,20 +2589,36 @@ closing_state:
 
         for (my ($i, $j) = (0, $from_vec_id); $j < $to_vec_id; $i++, $j++) {
             my $assign = "    ovec[$i] = matched_$i;";
-            $src .= $indent . "$assign\n";
+            $err_src .= $indent . "$assign\n";
             if ($debug > 1) {
-                $src .= $indent . qq{    fprintf(stderr, "$assign\\n");\n};
+                $err_src .= $indent . qq{    fprintf(stderr, "$assign\\n");\n};
             }
         }
     }
 
-    $src .= $indent . "    return $ret;  /* fallback */\n";
+    $err_src .= $indent . "    return $ret;  /* fallback */\n";
 
     if (!$seen_accept) {
-        $src .= <<'_EOC_';
+        $err_src .= <<'_EOC_';
     }
     return NO_MATCH;
 _EOC_
+    }
+
+    if ($used_error) {
+        $src .= <<_EOC_;
+    goto $err_label;
+_EOC_
+
+        my $labels = $err_labels->{$err_src};
+        if (!defined $labels) {
+            $labels = [];
+            $err_labels->{$err_src} = $labels;
+        }
+        push @$labels, $err_label;
+    } else {
+        # we avoid moving code without a label to prevent machine code inflation.
+        $src .= $err_src;
     }
 
     return $src;
