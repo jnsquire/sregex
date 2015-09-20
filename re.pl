@@ -118,8 +118,9 @@ sub count_chars_and_holes_in_ranges ($);
 sub analyze_dfa ($);
 sub gen_ovec_id_range ($);
 sub compile_and_run ($);
-sub caps_var_used ($$$);
+sub var_used ($$$$);
 sub func_used ($$);
+sub remove_assignment ($$$$);
 
 my $cc = "cc";
 my $debug = 0;
@@ -137,7 +138,8 @@ GetOptions("help|h",        \(my $help),
            "n=i",           \(my $nregexes),
            "out|o=s",       \(my $outfile),
            "timer",         \(my $timer),
-           "stdin",         \(my $stdin))
+           "stdin",         \(my $stdin),
+           "W",             \(my $no_warnings))
    or die usage(1);
 
 if ($help) {
@@ -1930,12 +1932,6 @@ sub gen_c_from_dfa ($) {
  */
 
 
-/* TODO: we should get rid of these compiler-specific progra eventually. */
-#if !__clang__
-#   pragma GCC diagnostic ignored "-Wunused-but-set-variable"
-#endif
-
-
 _EOC_
 
     for my $header (@$c_headers) {
@@ -2175,7 +2171,6 @@ _EOC_
 ${qualifier}int
 $func_name(const u_char *const s, size_t len, int *const ovec)
 {
-    int      c;
     unsigned i = 0;
 _EOC_
 
@@ -2200,9 +2195,32 @@ _EOC_
                                           \%used_vars, \%used_funcs);
     }
 
+    if ($no_warnings) {
+        my $changes;
+        do {{
+            $changes = 0;
+            while (my ($var_name, $spec) = each %used_vars) {
+                my ($type, $init, $users) = @$spec;
+                if (!%$users) {
+                    # found a var set but not used
+                    # FIXME this is a horrible hack by doing regex substitutions
+                    # on the generated C code. alas.
+                    $match_src1 =~ s{^\s*\Q$var_name\E = ([^\n]*);\n}{
+                                        $changes =
+                                            remove_assignment(\%used_vars,
+                                                              $var_name, $1,
+                                                              $changes);
+                                        "";
+                                    }meg;
+                }
+            }
+        }} while ($changes > 0);
+    }
+
     for my $var_name (sort keys %used_vars) {
         my $spec = $used_vars{$var_name};
-        my ($type, $init) = @$spec;
+        my ($type, $init, $users) = @$spec;
+        next if $no_warnings && !%$users;
         $match_src0 .= "    $type $var_name";
         if (defined $init) {
             $match_src0 .= " = $init;\n";
@@ -2263,6 +2281,28 @@ _EOC_
     $src .= "}\n";
 
     return $src;
+}
+
+sub remove_assignment ($$$$) {
+    my ($used_vars, $var_name, $rhs, $changes) = @_;
+    if ($rhs =~ /^[a-z]\w*$/) {
+        # found a variable in LHS.
+        my $dep_var = $rhs;
+        my $dep_spec = $used_vars->{$dep_var};
+        my $dep_users = $dep_spec->[2];
+        my $ref = --$dep_users->{$var_name};
+        if ($ref == 0) {
+            delete $dep_users->{$var_name};
+            if (!%$dep_users) {
+                $changes++;
+            }
+        }
+
+    }# elsif ($rhs !~ /^(?:i - 1|-1)$/) {
+        #die "bad RHS found: $rhs";
+    #}
+
+    return $changes;
 }
 
 sub gen_c_from_dfa_node ($$$$$) {
@@ -2492,6 +2532,7 @@ _EOC_
     my $to_accept;
 
     if ($gen_read_char && @$edges) {
+        var_used($used_vars, "c", undef, undef);
         if ($edges->[0]{to_accept}) {
             $src .= "    c = i < len ? s[i] : -1;\n    i++;\n";
             $to_accept = $edges->[0]{target};
@@ -2503,17 +2544,20 @@ _EOC_
         goto $err_label;
     }
 
-    c = s[i++];
+    c = s[i];
+    i++;
 _EOC_
             $used_error = 1;
         }
 
         if ($debug) {
+            var_used($used_vars, "c", undef, "-");
             $src .= qq{    fprintf(stderr, "reading new char %d (offset %d)\\n", c, i - 1);\n};
         }
     }
 
     if (!$to_accept && $use_switch) {
+        var_used($used_vars, "c", undef, "-");
         $src .= "    switch (c) {\n";
     }
 
@@ -2534,6 +2578,7 @@ _EOC_
         }
 
         if ($to_accept && @$edges > 1) {
+            var_used($used_vars, "c", undef, "-");
             $src .= "    if (c != -1) {\n";
             if ($use_switch) {
                 $src .= "        switch (c) {\n";
@@ -2728,6 +2773,7 @@ sub gen_c_from_dfa_edge ($$$$$$$) {
                 $src .= $indents[$indent_idx] . "/* $cond */\n";
             } else {
                 $src .= $indents[$indent_idx] . "if ($cond) {\n";
+                var_used($used_vars, "c", undef, "-");
             }
             $indent_idx++ if !$default_br;
         }
@@ -2823,6 +2869,7 @@ sub gen_c_from_dfa_edge ($$$$$$$) {
                            . "$idx;\n";
                 }
             } elsif ($assert eq '$') {
+                var_used($used_vars, "c", undef, "-");
                 $src .= $indent . 'asserts |= (c == -1 || c == 10) << ' . "$idx;\n";
             } elsif ($assert eq '\b') {
                 #warn "right is word: $right_is_word";
@@ -3007,11 +3054,12 @@ sub gen_capture_handler_c_code ($$$$$) {
                     }
                 } else {
                     my $to_var = "caps${to_row}_$id";
-                    caps_var_used($used_vars, $to_var, undef);
+                    var_used($used_vars, $to_var, undef, undef);
                     push @stores, "$to_var = i - 1;";
                     $to_be_stored{"$to_row-$id"} = 1;
                     if ($debug > 1) {
                         $echo_values{$to_var} = 1;
+                        var_used($used_vars, $to_var, undef, "-");
                     }
                 }
             }
@@ -3049,17 +3097,18 @@ sub gen_capture_handler_c_code ($$$$$) {
             for (my $i = $vec_range->[0]; $i < $vec_range->[1]; $i++) {
                 if (!$to_be_stored{"$to_row-$i"}) {
                     my $id = $i - $vec_range->[0];
+                    my $to_var = "matched_$id";
                     my $from_var;
                     if ($from_const_vec->[$i] eq '-1') {
                         #warn "HIT";
                         $from_var = '-1';
                     } else {
                         $from_var = "caps${from_row}_$i";
-                        caps_var_used($used_vars, $from_var, -1);
+                        var_used($used_vars, $from_var, -1, $to_var);
                     }
-                    $t .= $indent . "matched_$id = $from_var;\n";
+                    $t .= $indent . "$to_var = $from_var;\n";
                     if ($debug > 1) {
-                        $echo_values{"matched_$id"} = 1;
+                        $echo_values{$to_var} = 1;
                     }
                 }
             }
@@ -3075,9 +3124,9 @@ sub gen_capture_handler_c_code ($$$$$) {
                     my $to_var = "caps${to_row}_$i";
 
                     if ($to_save_rows{$to_row}) {
-                        caps_var_used($used_vars, $to_var, -1);
                         my $tmp_var = "tmp${to_row}_$i";
-                        caps_var_used($used_vars, $tmp_var, undef);
+                        var_used($used_vars, $to_var, -1, $tmp_var);
+                        var_used($used_vars, $tmp_var, undef, undef);
                         $t .= $indent . "$tmp_var = $to_var;\n";
                     }
 
@@ -3087,16 +3136,18 @@ sub gen_capture_handler_c_code ($$$$$) {
                             $from_var = '-1';
                         } elsif ($overwritten{$from_row} && !$to_be_stored{"$from_row-$i"}) {
                             $from_var = "tmp${from_row}_$i";
-                            caps_var_used($used_vars, $from_var, undef);
+                            var_used($used_vars, $from_var, undef, $to_var);
                         } else {
                             $from_var = "caps${from_row}_$i";
-                            caps_var_used($used_vars, $from_var, -1);
+                            var_used($used_vars, $from_var, -1, $to_var);
                         }
-                        caps_var_used($used_vars, $to_var, undef);
+                        var_used($used_vars, $to_var, undef, undef);
                         $t .= $indent . "$to_var = $from_var;\n";
                     }
                     if ($debug > 1) {
-                        caps_var_used($used_vars, $to_var, -1);
+                        # "-" is a special place holder to mean a function
+                        # call or something
+                        var_used($used_vars, $to_var, -1, "-");
                         $echo_values{$to_var} = 1;
                     }
                 }
@@ -3199,6 +3250,8 @@ Options:
     --stdin         accept the subject string (to be matched) from the
                     stdin device instead of the second command-line
                     argument.
+
+    -W              avoid all the C compiler warnings (even under -Wall)
 _EOC_
     if ($rc) {
         warn $msg;
@@ -3358,8 +3411,8 @@ sub gen_ovec_id_range ($) {
     return $from_vec_id, $to_vec_id, $re_id;
 }
 
-sub caps_var_used ($$$) {
-    my ($used_vars, $var_name, $init) = @_;
+sub var_used ($$$$) {
+    my ($used_vars, $var_name, $init, $user) = @_;
     my $spec = $used_vars->{$var_name};
     if (defined $spec) {
         my $old_init = $spec->[1];
@@ -3371,8 +3424,19 @@ sub caps_var_used ($$$) {
         } else {
             $spec->[1] = $init;
         }
+        if ($no_warnings && defined $user) {
+            $spec->[2]{$user}++;
+        }
     } else {
-        $used_vars->{$var_name} = ["int", $init];
+        if ($no_warnings) {
+            my $users = {};
+            if (defined $user) {
+                $users->{$user} = 1;
+            }
+            $used_vars->{$var_name} = ["int", $init, $users];
+        } else {
+            $used_vars->{$var_name} = ["int", $init];
+        }
     }
 }
 
