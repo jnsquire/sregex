@@ -118,7 +118,7 @@ sub count_chars_and_holes_in_ranges ($);
 sub analyze_dfa ($);
 sub gen_ovec_id_range ($);
 sub compile_and_run ($);
-sub caps_var_used ($$);
+sub caps_var_used ($$$);
 sub func_used ($$);
 
 my $cc = "cc";
@@ -3007,7 +3007,7 @@ sub gen_capture_handler_c_code ($$$$$) {
                     }
                 } else {
                     my $to_var = "caps${to_row}_$id";
-                    caps_var_used($used_vars, $to_var);
+                    caps_var_used($used_vars, $to_var, undef);
                     push @stores, "$to_var = i - 1;";
                     $to_be_stored{"$to_row-$id"} = 1;
                     if ($debug > 1) {
@@ -3055,7 +3055,7 @@ sub gen_capture_handler_c_code ($$$$$) {
                         $from_var = '-1';
                     } else {
                         $from_var = "caps${from_row}_$i";
-                        caps_var_used($used_vars, $from_var);
+                        caps_var_used($used_vars, $from_var, -1);
                     }
                     $t .= $indent . "matched_$id = $from_var;\n";
                     if ($debug > 1) {
@@ -3073,27 +3073,30 @@ sub gen_capture_handler_c_code ($$$$$) {
             for (my $i = 0; $i < $nvec; $i++) {
                 if (!$to_be_stored{"$to_row-$i"}) {
                     my $to_var = "caps${to_row}_$i";
+
                     if ($to_save_rows{$to_row}) {
-                        caps_var_used($used_vars, $to_var);
-                        $t .= $indent . "tmp${to_row}_$i = $to_var;\n";
+                        caps_var_used($used_vars, $to_var, -1);
+                        my $tmp_var = "tmp${to_row}_$i";
+                        caps_var_used($used_vars, $tmp_var, undef);
+                        $t .= $indent . "$tmp_var = $to_var;\n";
                     }
-                    my $from_var;
-                    if ($from_const_vec->[$i] eq '-1') {
-                        $from_var = '-1';
-                    } elsif ($overwritten{$from_row} && !$to_be_stored{"$from_row-$i"}) {
-                        $from_var = "tmp${from_row}_$i";
-                    } else {
-                        $from_var = "caps${from_row}_$i";
-                    }
+
                     if (!$to_nfa_node->{"can_kill_$i"}) {
-                        if ($from_var =~ /^caps/) {
-                            caps_var_used($used_vars, $from_var);
+                        my $from_var;
+                        if ($from_const_vec->[$i] eq '-1') {
+                            $from_var = '-1';
+                        } elsif ($overwritten{$from_row} && !$to_be_stored{"$from_row-$i"}) {
+                            $from_var = "tmp${from_row}_$i";
+                            caps_var_used($used_vars, $from_var, undef);
+                        } else {
+                            $from_var = "caps${from_row}_$i";
+                            caps_var_used($used_vars, $from_var, -1);
                         }
-                        caps_var_used($used_vars, $to_var);
+                        caps_var_used($used_vars, $to_var, undef);
                         $t .= $indent . "$to_var = $from_var;\n";
                     }
                     if ($debug > 1) {
-                        caps_var_used($used_vars, $to_var);
+                        caps_var_used($used_vars, $to_var, -1);
                         $echo_values{$to_var} = 1;
                     }
                 }
@@ -3106,15 +3109,6 @@ sub gen_capture_handler_c_code ($$$$$) {
     if (@transfers) {
         if (%to_save_rows) {
             $src .= $indent . "{\n";
-            my @tmp;
-            for my $row (sort keys %to_save_rows) {
-                for (my $i = 0; $i < $nvec; $i++) {
-                    if (!$to_be_stored{"$row-$i"}) {
-                        push @tmp, "tmp${row}_$i";
-                    }
-                }
-            }
-            $src .= $indent . "int " .  join(", ", @tmp) . ";\n";
         }
         $src .= join "", @transfers;
         if ($debug > 1) {
@@ -3364,10 +3358,21 @@ sub gen_ovec_id_range ($) {
     return $from_vec_id, $to_vec_id, $re_id;
 }
 
-sub caps_var_used ($$) {
-    my ($used_vars, $var_name) = @_;
-    if (!exists $used_vars->{$var_name}) {
-        $used_vars->{$var_name} = ["int", -1];
+sub caps_var_used ($$$) {
+    my ($used_vars, $var_name, $init) = @_;
+    my $spec = $used_vars->{$var_name};
+    if (defined $spec) {
+        my $old_init = $spec->[1];
+        if (defined $old_init) {
+            if (defined $init && $init ne $old_init) {
+                die "ERROR: different initial values for C variable ",
+                    "$var_name: $init vs $old_init";
+            }
+        } else {
+            $spec->[1] = $init;
+        }
+    } else {
+        $used_vars->{$var_name} = ["int", $init];
     }
 }
 
