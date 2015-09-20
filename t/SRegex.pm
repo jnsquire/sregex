@@ -338,7 +338,7 @@ sub parse_sregex_dfa_res ($$$) {
     #warn "data: $data";
     my ($res, $err);
     #warn @opts;
-    my @cmd = ("./re.pl", "--debug=0", "--cc=tcc", "--stdin", @$opts, ref $re ? @$re : $re);
+    my @cmd = ("./re.pl", "--debug=2", "--cc=gcc -Werror -Wall", "--stdin", @$opts, ref $re ? @$re : $re);
     #warn "command: @cmd";
 
     run3 \@cmd, \$data, \$res, \$err;

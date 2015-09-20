@@ -111,14 +111,15 @@ sub gen_dfa_edge ($$$$$);
 sub resolve_dfa_edge ($$$$$$$$);
 sub gen_dfa_edges_for_asserts ($$$$$$);
 sub gen_capture_handler_c_code ($$$$$);
-sub gen_c_from_dfa_edge ($$$$$$);
-sub gen_c_from_dfa_node ($$$$);
+sub gen_c_from_dfa_edge ($$$$$$$);
+sub gen_c_from_dfa_node ($$$$$);
 sub dump_code ($);
 sub count_chars_and_holes_in_ranges ($);
 sub analyze_dfa ($);
 sub gen_ovec_id_range ($);
 sub compile_and_run ($);
 sub caps_var_used ($$);
+sub func_used ($$);
 
 my $cc = "cc";
 my $debug = 0;
@@ -340,7 +341,6 @@ my $edge_attr =
 my %nfa_paths;
 my %pc2assert;
 my $used_asserts;
-my $used_word_asserts;
 
 #my $begin = time;
 my $nfa = gen_nfa();
@@ -486,9 +486,6 @@ sub gen_nfa () {
                 $found = 1;
             }
             my $assert = $bc->[1];
-            if (!$used_word_asserts && ($assert eq '\b' || $assert eq '\B')) {
-                $used_word_asserts = 1;
-            }
         }
 
         $opcode = bc_is_nfa_node($bc);
@@ -1934,9 +1931,7 @@ sub gen_c_from_dfa ($) {
 
 
 /* TODO: we should get rid of these compiler-specific progra eventually. */
-#if __clang__
-#   pragma GCC diagnostic ignored "-Wunused-function"
-#else
+#if !__clang__
 #   pragma GCC diagnostic ignored "-Wunused-but-set-variable"
 #endif
 
@@ -2009,37 +2004,6 @@ _EOC_
     if (!$no_main) {
         $src .= <<_EOC_;
 static int $func_name(const u_char *const s, size_t len, int *const ovec);
-
-
-_EOC_
-    }
-
-    if ($used_word_asserts) {
-        $src .= <<_EOC_;
-static inline int
-is_word(int c)
-{
-    /* (isalnum(c) || c == '_'); */
-    switch (c) {
-_EOC_
-
-        for my $c ('0' .. '9', 'A' .. 'Z', 'a' .. 'z', '_') {
-            $src .= "    case '$c':\n";
-        }
-
-        $src .= <<_EOC_;
-        return 1;
-    default:
-        return 0;
-    }
-}
-
-
-static inline int
-is_word_boundary(int a, int b)
-{
-    return (is_word(a) ^ is_word(b));
-}
 
 
 _EOC_
@@ -2196,16 +2160,19 @@ _EOC_
 _EOC_
     }
 
+    my $match_src0 = '';
+    my $qualifier = '';
+
     if (!$no_main) {
-        $src .= "static ";
+        $qualifier .= "static ";
     }
 
-    $src .= <<_EOC_;
+    $match_src0 .= <<_EOC_;
 /*
  * $func_name: the "ovec" array should be allocated by the caller with at
  * least $caller_nvec elements.
  */
-int
+${qualifier}int
 $func_name(const u_char *const s, size_t len, int *const ovec)
 {
     int      c;
@@ -2214,37 +2181,74 @@ _EOC_
 
     {
         for (my $i = 0; $i < $caller_nvec; $i++) {
-            $src .= "    int matched_$i = -1;\n";
+            $match_src0 .= "    int matched_$i = -1;\n";
         }
 
         if ($nregexes != SINGLE_REGEX) {
-            $src .= "    int matched_id = NO_MATCH;  /* (pending) matched regex ID */\n";
+            $match_src0 .= "    int matched_id = NO_MATCH;  /* (pending) matched regex ID */\n";
         }
     }
 
     my $dfa_nodes = $dfa->{nodes};
+    my $match_src1 = '';
 
-    my (%err_labels, %used_vars);
-
-    my $main_src = '';
+    my (%err_labels, %used_vars, %used_funcs);
 
     for my $node (@$dfa_nodes) {
         next if defined $node->{assert_info} || $node->{accept};
-        $main_src .= gen_c_from_dfa_node($node, $nvec, \%err_labels, \%used_vars);
+        $match_src1 .= gen_c_from_dfa_node($node, $nvec, \%err_labels,
+                                          \%used_vars, \%used_funcs);
     }
 
     for my $var_name (sort keys %used_vars) {
         my $spec = $used_vars{$var_name};
         my ($type, $init) = @$spec;
-        $src .= "    $type $var_name";
+        $match_src0 .= "    $type $var_name";
         if (defined $init) {
-            $src .= " = $init;\n";
+            $match_src0 .= " = $init;\n";
         } else {
-            $src .= ";\n";
+            $match_src0 .= ";\n";
         }
     }
 
-    $src .= $main_src;
+    if ($used_funcs{is_word} || $used_funcs{is_word_boundary}) {
+        $src .= <<_EOC_;
+
+static inline int
+is_word(int c)
+{
+    /* (isalnum(c) || c == '_'); */
+    switch (c) {
+_EOC_
+
+        for my $c ('0' .. '9', 'A' .. 'Z', 'a' .. 'z', '_') {
+            $src .= "    case '$c':\n";
+        }
+
+        $src .= <<_EOC_;
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+_EOC_
+    }
+
+    if ($used_funcs{is_word_boundary}) {
+        $src .= <<_EOC_;
+
+static inline int
+is_word_boundary(int a, int b)
+{
+    return (is_word(a) ^ is_word(b));
+}
+
+_EOC_
+    }
+
+    $src .= $match_src0;
+    $src .= $match_src1;
 
     # generate error states for the corresponding DFA states
     for my $err_src (sort keys %err_labels) {
@@ -2257,11 +2261,12 @@ _EOC_
     }
 
     $src .= "}\n";
+
     return $src;
 }
 
-sub gen_c_from_dfa_node ($$$$) {
-    my ($node, $nvec, $err_labels, $used_vars) = @_;
+sub gen_c_from_dfa_node ($$$$$) {
+    my ($node, $nvec, $err_labels, $used_vars, $used_funcs) = @_;
     my $idx = $node->{idx};
 
     my $level = 1;
@@ -2299,7 +2304,8 @@ sub gen_c_from_dfa_node ($$$$) {
             my $chr = $a_ranges->[0];
 
             $b->{memchr} = 1;
-            my ($b_src) = gen_c_from_dfa_edge($node, $b, $level, $nvec, undef, $used_vars);
+            my ($b_src) = gen_c_from_dfa_edge($node, $b, $level, $nvec, undef,
+                                              $used_vars, $used_funcs);
             delete $b->{memchr};
 
             $src .= <<_EOC_;
@@ -2326,7 +2332,7 @@ _EOC_
 _EOC_
             $a->{default_branch} = 1;
             my ($a_src) = gen_c_from_dfa_edge($node, $a, $level, $nvec, undef,
-                                              $used_vars);
+                                              $used_vars, $used_funcs);
             delete $a->{default_branch};
 
             $src .= qq{    fprintf(stderr, "* entering state $label (i=%d len=%d)\\n", i, (int) len);\n} if $debug;
@@ -2403,7 +2409,7 @@ _EOC_
                 $last->{memchr} = 1;
                 my ($last_handler_src) =
                     gen_c_from_dfa_edge($node, $last, $level, $nvec, undef,
-                                        $used_vars);
+                                        $used_vars, $used_funcs);
                 delete $last->{memchr};
 
                 $src .= <<_EOC_;
@@ -2518,7 +2524,8 @@ _EOC_
                                                                    $level,
                                                                    $nvec,
                                                                    $use_switch,
-                                                                   $used_vars);
+                                                                   $used_vars,
+                                                                   $used_funcs);
 
         $src .= $edge_src;
 
@@ -2628,8 +2635,9 @@ _EOC_
     return $src;
 }
 
-sub gen_c_from_dfa_edge ($$$$$$) {
-    my ($from_node, $edge, $level, $nvec, $use_switch, $used_vars) = @_;
+sub gen_c_from_dfa_edge ($$$$$$$) {
+    my ($from_node, $edge, $level, $nvec, $use_switch, $used_vars,
+        $used_funcs) = @_;
 
     my $from_node_idx = $from_node->{idx};
 
@@ -2768,7 +2776,8 @@ sub gen_c_from_dfa_edge ($$$$$$) {
                                                               $level + 2,
                                                               $nvec,
                                                               $use_switch,
-                                                              $used_vars);
+                                                              $used_vars,
+                                                              $used_funcs);
                 if (defined $inner) {
                     $src .= $inner;
                 }
@@ -2832,6 +2841,7 @@ sub gen_c_from_dfa_edge ($$$$$$) {
                             }
 
                         } else {
+                            func_used($used_funcs, "is_word");
                             if ($min_len >= 1) {
                                 $src .= $indent . 'asserts |= !is_word(s[i - 2]) << ' . "$idx;\n";
                             } else {
@@ -2849,6 +2859,7 @@ sub gen_c_from_dfa_edge ($$$$$$) {
                             }
 
                         } else {
+                            func_used($used_funcs, "is_word");
                             if ($min_len >= 1) {
                                 $src .= $indent . 'asserts |= is_word(s[i - 2]) << '
                                        . "$idx;\n";
@@ -2861,6 +2872,7 @@ sub gen_c_from_dfa_edge ($$$$$$) {
 
                 } else {
                     if (defined $left_is_word && $left_is_word != -1) {
+                        func_used($used_funcs, "is_word");
                         if ($left_is_word == 1) {  # right char must not be a word
                             $src .= $indent . 'asserts |= !is_word(c) << ' . "$idx;\n";
                         } else {  # right char must be a word
@@ -2868,6 +2880,7 @@ sub gen_c_from_dfa_edge ($$$$$$) {
                         }
 
                     } else {
+                        func_used($used_funcs, "is_word_boundary");
                         if ($min_len >= 1) {
                             $src .= $indent . 'asserts |= is_word_boundary(s[i - 2], c) << '
                                    . "$idx;\n";
@@ -2878,6 +2891,7 @@ sub gen_c_from_dfa_edge ($$$$$$) {
                     }
                 }
             } elsif ($assert eq '\B') {
+                func_used($used_funcs, "is_word_boundary");
                 if ($min_len >= 1) {
                     $src .= $indent . 'asserts |= !is_word_boundary(s[i - 2], c) << '
                            . "$idx;\n";
@@ -3354,5 +3368,12 @@ sub caps_var_used ($$) {
     my ($used_vars, $var_name) = @_;
     if (!exists $used_vars->{$var_name}) {
         $used_vars->{$var_name} = ["int", -1];
+    }
+}
+
+sub func_used ($$) {
+    my ($used_funcs, $func_name) = @_;
+    if (!exists $used_funcs->{$func_name}) {
+        $used_funcs->{$func_name} = 1;
     }
 }
