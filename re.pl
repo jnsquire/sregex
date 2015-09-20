@@ -392,10 +392,10 @@ sub compile_and_run ($) {
     print $fh $c;
     close $fh;
 
-    #system("cc -o $exefile -Wall -Wno-unused-but-set-variable -Werror -O0 $fname") == 0
+    #system("cc -o $exefile -Wall -Werror -O0 $fname") == 0
     my $extra_ccopt = "";
     if ($debug && $cc =~ /\bgcc\b/) {
-        $extra_ccopt = "-Wall -Wno-unused-but-set-variable -Werror";
+        $extra_ccopt = "-Wall -Werror";
     }
 
     return if $compile_only;
