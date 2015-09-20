@@ -1933,7 +1933,6 @@ sub gen_c_from_dfa ($) {
 
 
 /* TODO: we should get rid of these compiler-specific progra eventually. */
-#pragma GCC diagnostic ignored "-Wunused-label"
 #pragma GCC diagnostic ignored "-Wunused-variable"
 #if __clang__
 #   pragma GCC diagnostic ignored "-Wunused-function"
