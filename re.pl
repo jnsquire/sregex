@@ -110,14 +110,15 @@ sub usage ($);
 sub gen_dfa_edge ($$$$$);
 sub resolve_dfa_edge ($$$$$$$$);
 sub gen_dfa_edges_for_asserts ($$$$$$);
-sub gen_capture_handler_c_code ($$$$);
-sub gen_c_from_dfa_edge ($$$$$);
-sub gen_c_from_dfa_node ($$$);
+sub gen_capture_handler_c_code ($$$$$);
+sub gen_c_from_dfa_edge ($$$$$$);
+sub gen_c_from_dfa_node ($$$$);
 sub dump_code ($);
 sub count_chars_and_holes_in_ranges ($);
 sub analyze_dfa ($);
 sub gen_ovec_id_range ($);
 sub compile_and_run ($);
+sub caps_var_used ($$);
 
 my $cc = "cc";
 my $debug = 0;
@@ -391,10 +392,10 @@ sub compile_and_run ($) {
     print $fh $c;
     close $fh;
 
-    #system("cc -o $exefile -Wall -Wno-unused-label -Wno-unused-variable -Wno-unused-but-set-variable -Werror -O0 $fname") == 0
+    #system("cc -o $exefile -Wall -Wno-unused-but-set-variable -Werror -O0 $fname") == 0
     my $extra_ccopt = "";
     if ($debug && $cc =~ /\bgcc\b/) {
-        $extra_ccopt = "-Wall -Wno-unused-label -Wno-unused-variable -Wno-unused-but-set-variable -Werror";
+        $extra_ccopt = "-Wall -Wno-unused-but-set-variable -Werror";
     }
 
     return if $compile_only;
@@ -1933,7 +1934,6 @@ sub gen_c_from_dfa ($) {
 
 
 /* TODO: we should get rid of these compiler-specific progra eventually. */
-#pragma GCC diagnostic ignored "-Wunused-variable"
 #if __clang__
 #   pragma GCC diagnostic ignored "-Wunused-function"
 #else
@@ -2224,28 +2224,27 @@ _EOC_
 
     my $dfa_nodes = $dfa->{nodes};
 
-    my $max_threads = 0;
-    for my $node (@$dfa_nodes) {
-        my $n = @{ $node->{states} };
-        if ($n > $max_threads) {
-            $max_threads = $n;
-        }
-    }
+    my (%err_labels, %used_vars);
 
-    $src .= "    /* for maximum $max_threads threads */\n";
-    for (my $i = 0; $i < $max_threads; $i++) {
-        for (my $j = 0; $j < $nvec; $j++) {
-            my $var = "caps${i}_$j";
-            $src .= "    int $var = -1;\n";
-        }
-    }
-
-    my %err_labels;
+    my $main_src = '';
 
     for my $node (@$dfa_nodes) {
         next if defined $node->{assert_info} || $node->{accept};
-        $src .= gen_c_from_dfa_node($node, $nvec, \%err_labels);
+        $main_src .= gen_c_from_dfa_node($node, $nvec, \%err_labels, \%used_vars);
     }
+
+    for my $var_name (sort keys %used_vars) {
+        my $spec = $used_vars{$var_name};
+        my ($type, $init) = @$spec;
+        $src .= "    $type $var_name";
+        if (defined $init) {
+            $src .= " = $init;\n";
+        } else {
+            $src .= ";\n";
+        }
+    }
+
+    $src .= $main_src;
 
     # generate error states for the corresponding DFA states
     for my $err_src (sort keys %err_labels) {
@@ -2261,8 +2260,8 @@ _EOC_
     return $src;
 }
 
-sub gen_c_from_dfa_node ($$$) {
-    my ($node, $nvec, $err_labels) = @_;
+sub gen_c_from_dfa_node ($$$$) {
+    my ($node, $nvec, $err_labels, $used_vars) = @_;
     my $idx = $node->{idx};
 
     my $level = 1;
@@ -2300,7 +2299,7 @@ sub gen_c_from_dfa_node ($$$) {
             my $chr = $a_ranges->[0];
 
             $b->{memchr} = 1;
-            my ($b_src) = gen_c_from_dfa_edge($node, $b, $level, $nvec, undef);
+            my ($b_src) = gen_c_from_dfa_edge($node, $b, $level, $nvec, undef, $used_vars);
             delete $b->{memchr};
 
             $src .= <<_EOC_;
@@ -2326,7 +2325,8 @@ _EOC_
     c = $chr;
 _EOC_
             $a->{default_branch} = 1;
-            my ($a_src) = gen_c_from_dfa_edge($node, $a, $level, $nvec, undef);
+            my ($a_src) = gen_c_from_dfa_edge($node, $a, $level, $nvec, undef,
+                                              $used_vars);
             delete $a->{default_branch};
 
             $src .= qq{    fprintf(stderr, "* entering state $label (i=%d len=%d)\\n", i, (int) len);\n} if $debug;
@@ -2402,7 +2402,8 @@ _EOC_
 
                 $last->{memchr} = 1;
                 my ($last_handler_src) =
-                    gen_c_from_dfa_edge($node, $last, $level, $nvec, undef);
+                    gen_c_from_dfa_edge($node, $last, $level, $nvec, undef,
+                                        $used_vars);
                 delete $last->{memchr};
 
                 $src .= <<_EOC_;
@@ -2513,7 +2514,11 @@ _EOC_
     my $seen_accept;
     for my $edge (@$edges) {
         my $edge_src;
-        ($edge_src, $to_accept, $use_switch) = gen_c_from_dfa_edge($node, $edge, $level, $nvec, $use_switch);
+        ($edge_src, $to_accept, $use_switch) = gen_c_from_dfa_edge($node, $edge,
+                                                                   $level,
+                                                                   $nvec,
+                                                                   $use_switch,
+                                                                   $used_vars);
 
         $src .= $edge_src;
 
@@ -2623,8 +2628,8 @@ _EOC_
     return $src;
 }
 
-sub gen_c_from_dfa_edge ($$$$$) {
-    my ($from_node, $edge, $level, $nvec, $use_switch) = @_;
+sub gen_c_from_dfa_edge ($$$$$$) {
+    my ($from_node, $edge, $level, $nvec, $use_switch, $used_vars) = @_;
 
     my $from_node_idx = $from_node->{idx};
 
@@ -2758,8 +2763,12 @@ sub gen_c_from_dfa_edge ($$$$$) {
             if (defined $shadowing) {
                 my $indent = $indents[$indent_idx];
                 $src .= $indent . "if (asserts != 1) { /* shadowed DFA edge */\n";
-                my ($inner, $to_accept) = gen_c_from_dfa_edge($from_node, $shadowing,
-                                                              $level + 2, $nvec, $use_switch);
+                my ($inner, $to_accept) = gen_c_from_dfa_edge($from_node,
+                                                              $shadowing,
+                                                              $level + 2,
+                                                              $nvec,
+                                                              $use_switch,
+                                                              $used_vars);
                 if (defined $inner) {
                     $src .= $inner;
                 }
@@ -2884,7 +2893,8 @@ sub gen_c_from_dfa_edge ($$$$$) {
             } else {
                 die "TODO";
             }
-            $src .= $indent . qq{fprintf(stderr, "assertion $assert test result: %d, idx = $idx, i = %d, c = %d\\n", asserts, i, c);\n}
+            (my $escaped_assert = $assert) =~ s/\\/\\\\/g;
+            $src .= $indent . qq{fprintf(stderr, "assertion $escaped_assert test result: %d, idx = $idx, i = %d, c = %d\\n", (int) asserts, i, c);\n}
                 if $debug;
         }
 
@@ -2908,7 +2918,8 @@ sub gen_c_from_dfa_edge ($$$$$) {
             if ($target->{accept}) {
                 $to_accept = $target;
             }
-            $src .= gen_capture_handler_c_code($subedge, $to_accept, $indent2, $nvec);
+            $src .= gen_capture_handler_c_code($subedge, $to_accept, $indent2,
+                                               $nvec, $used_vars);
             my $to = $target->{idx};
             if (!$to_accept) {
                 $src .= $indent2 . "goto st$to;\n";
@@ -2919,7 +2930,8 @@ sub gen_c_from_dfa_edge ($$$$$) {
     } else {
         # normal DFA edge w/o assertions
 
-        $src .= gen_capture_handler_c_code($edge, $to_accept, $indent, $nvec);
+        $src .= gen_capture_handler_c_code($edge, $to_accept, $indent, $nvec,
+                                           $used_vars);
 
         my $to = $target->{idx};
         if (!$to_accept && !$edge->{memchr}) {
@@ -2948,8 +2960,8 @@ sub gen_c_from_dfa_edge ($$$$$) {
     return $src, $to_accept, $new_use_switch;
 }
 
-sub gen_capture_handler_c_code ($$$$) {
-    my ($edge, $to_accept, $indent, $nvec) = @_;
+sub gen_capture_handler_c_code ($$$$$) {
+    my ($edge, $to_accept, $indent, $nvec, $used_vars) = @_;
 
     my $src = '';
     my $target = $edge->{target};
@@ -2981,6 +2993,7 @@ sub gen_capture_handler_c_code ($$$$) {
                     }
                 } else {
                     my $to_var = "caps${to_row}_$id";
+                    caps_var_used($used_vars, $to_var);
                     push @stores, "$to_var = i - 1;";
                     $to_be_stored{"$to_row-$id"} = 1;
                     if ($debug > 1) {
@@ -3028,6 +3041,7 @@ sub gen_capture_handler_c_code ($$$$) {
                         $from_var = '-1';
                     } else {
                         $from_var = "caps${from_row}_$i";
+                        caps_var_used($used_vars, $from_var);
                     }
                     $t .= $indent . "matched_$id = $from_var;\n";
                     if ($debug > 1) {
@@ -3046,6 +3060,7 @@ sub gen_capture_handler_c_code ($$$$) {
                 if (!$to_be_stored{"$to_row-$i"}) {
                     my $to_var = "caps${to_row}_$i";
                     if ($to_save_rows{$to_row}) {
+                        caps_var_used($used_vars, $to_var);
                         $t .= $indent . "tmp${to_row}_$i = $to_var;\n";
                     }
                     my $from_var;
@@ -3057,9 +3072,14 @@ sub gen_capture_handler_c_code ($$$$) {
                         $from_var = "caps${from_row}_$i";
                     }
                     if (!$to_nfa_node->{"can_kill_$i"}) {
+                        if ($from_var =~ /^caps/) {
+                            caps_var_used($used_vars, $from_var);
+                        }
+                        caps_var_used($used_vars, $to_var);
                         $t .= $indent . "$to_var = $from_var;\n";
                     }
                     if ($debug > 1) {
+                        caps_var_used($used_vars, $to_var);
                         $echo_values{$to_var} = 1;
                     }
                 }
@@ -3328,4 +3348,11 @@ sub gen_ovec_id_range ($) {
     $to_vec_id = $from_vec_id + $target_vec_count;
 
     return $from_vec_id, $to_vec_id, $re_id;
+}
+
+sub caps_var_used ($$) {
+    my ($used_vars, $var_name) = @_;
+    if (!exists $used_vars->{$var_name}) {
+        $used_vars->{$var_name} = ["int", -1];
+    }
 }
