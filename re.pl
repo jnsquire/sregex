@@ -120,7 +120,7 @@ sub gen_ovec_id_range ($);
 sub compile_and_run ($);
 sub var_used ($$$$);
 sub func_used ($$);
-sub remove_assignment ($$$$);
+sub remove_assignment ($$$);
 
 my $cc = "cc";
 my $debug = 0;
@@ -2196,25 +2196,32 @@ _EOC_
     }
 
     if ($no_warnings) {
-        my $changes;
-        do {{
-            $changes = 0;
-            while (my ($var_name, $spec) = each %used_vars) {
-                my ($type, $init, $users) = @$spec;
-                if (!%$users) {
-                    # found a var set but not used
-                    # FIXME this is a horrible hack by doing regex substitutions
-                    # on the generated C code. alas.
-                    $match_src1 =~ s{^\s*\Q$var_name\E = ([^\n]*);\n}{
-                                        $changes =
-                                            remove_assignment(\%used_vars,
-                                                              $var_name, $1,
-                                                              $changes);
-                                        "";
-                                    }meg;
-                }
+        my @tasks;
+        while (my ($var_name, $spec) = each %used_vars) {
+            my ($type, $init, $users) = @$spec;
+            if (!%$users) {
+                push @tasks, [$var_name, $spec];
             }
-        }} while ($changes > 0);
+        }
+
+        while (@tasks) {
+            my $task = pop @tasks;
+            my ($var_name, $spec) = @$task;
+            my ($type, $init, $users) = @$spec;
+            die if %$users;
+            # found a var set but not used
+            # FIXME this is a horrible hack by doing regex substitutions
+            # on the generated C code. alas.
+            $match_src1 =~ s{^\s*\Q$var_name\E = ([^\n]*);\n}{
+                                my $new_task =
+                                    remove_assignment(\%used_vars,
+                                                      $var_name, $1);
+                                if (defined $new_task) {
+                                    push @tasks, $new_task;
+                                }
+                                "";
+                            }meg;
+        }
     }
 
     for my $var_name (sort keys %used_vars) {
@@ -2283,8 +2290,8 @@ _EOC_
     return $src;
 }
 
-sub remove_assignment ($$$$) {
-    my ($used_vars, $var_name, $rhs, $changes) = @_;
+sub remove_assignment ($$$) {
+    my ($used_vars, $var_name, $rhs) = @_;
     if ($rhs =~ /^[a-z]\w*$/) {
         # found a variable in LHS.
         my $dep_var = $rhs;
@@ -2294,15 +2301,14 @@ sub remove_assignment ($$$$) {
         if ($ref == 0) {
             delete $dep_users->{$var_name};
             if (!%$dep_users) {
-                $changes++;
+                return [$dep_var, $dep_spec];
             }
         }
-
     }# elsif ($rhs !~ /^(?:i - 1|-1)$/) {
         #die "bad RHS found: $rhs";
     #}
 
-    return $changes;
+    return undef;
 }
 
 sub gen_c_from_dfa_node ($$$$$) {
