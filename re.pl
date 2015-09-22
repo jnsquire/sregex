@@ -2768,17 +2768,47 @@ sub gen_c_from_dfa_edge ($$$$$$$) {
             $indent_idx++;
 
         } else {
+            my $ind = $indents[$indent_idx];
             my $cond;
             if (@cond == 1) {
                 $cond = $cond[0];
             } else {
-                $cond = join " || ", map { "($_)" } @cond;
+                @cond = map { "($_)" } @cond;
+                $cond = join " || ", @cond;
             }
 
             if ($default_br) {
-                $src .= $indents[$indent_idx] . "/* $cond */\n";
+                if (length($ind) + length("/*  */") + length($cond) > 78) {
+                    my $i = 0;
+                    for my $c (@cond) {
+                        if ($i++ == 0) {
+                            $src .= $ind . "/* $c\n";
+                        } else {
+                            $src .= $ind . " * || $c\n";
+                        }
+                    }
+                    $src .= $ind . " */\n";
+                } else {
+                    $src .= $ind . "/* $cond */\n";
+                }
             } else {
-                $src .= $indents[$indent_idx] . "if ($cond) {\n";
+                if (length($ind) + length("if () {") + length($cond) > 78) {
+                    my $i = 0;
+                    my $last = $#cond;
+                    for my $c (@cond) {
+                        if ($i == 0) {
+                            $src .= $ind . "if ($c\n";
+                        } elsif ($i == $last) {
+                            $src .= $ind . "    || $c)\n$ind\{\n";
+                        } else {
+                            $src .= $ind . "    || $c\n";
+                        }
+                    } continue {
+                        $i++;
+                    }
+                } else {
+                    $src .= $ind . "if ($cond) {\n";
+                }
                 var_used($used_vars, "c", undef, "-");
             }
             $indent_idx++ if !$default_br;
