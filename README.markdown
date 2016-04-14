@@ -56,6 +56,7 @@ Already rewrote the code base of Russ Cox's re1 library using the nginx coding s
 Already ported the Thompson and Pike VM backends to sregex. The former is just for yes-or-no matching, and the latter also supports sub-match capturing.
 
 Implemented the case-insensitive matching mode via the `SRE_REGEX_CASELESS` flag.
+Implemented single line matching mode via the `SRE_REGEX_NEWLINE` flag.
 
 The full streaming matching API for the sregex engine has already been implemented,
 for both the Pike and Thompson regex VMs. The sub-match capturing also supports streaming processing.

@@ -89,7 +89,8 @@ SRE_API void sre_destroy_pool(sre_pool_t *pool);
 
 /* regex flags */
 enum {
-    SRE_REGEX_CASELESS = 1
+    SRE_REGEX_CASELESS = 1,
+    SRE_REGEX_NEWLINE = 2,
 };
 
 

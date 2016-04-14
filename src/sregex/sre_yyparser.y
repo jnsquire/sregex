@@ -47,12 +47,13 @@ typedef struct YYLTYPE {
 
 
 static int yylex(YYSTYPE *lvalp, YYLTYPE *locp, sre_pool_t *pool,
-    sre_char **src);
+    sre_char **src, int flags);
 static void yyerror(YYLTYPE *locp, sre_pool_t *pool, sre_char **src,
     sre_uint_t *ncaps, int flags, sre_regex_t **parsed, sre_char **err_pos,
     char *s);
 static sre_regex_t *sre_regex_desugar_counted_repetition(sre_pool_t *pool,
     sre_regex_t *subj, sre_regex_cquant_t *cquant, unsigned greedy);
+static sre_regex_t *sre_regex_create_noteol(sre_pool_t *pool);
 
 %}
 
@@ -66,6 +67,7 @@ static sre_regex_t *sre_regex_desugar_counted_repetition(sre_pool_t *pool,
 
 %lex-param {sre_pool_t *pool}
 %lex-param {sre_char *src}
+%lex-param {int flags}
 
 
 %parse-param {sre_pool_t *pool}
@@ -288,7 +290,12 @@ atom: '(' count alt ')'
 
     | '.'
       {
-        $$ = sre_regex_create(pool, SRE_REGEX_TYPE_DOT, NULL, NULL);
+        if (flags & SRE_REGEX_NEWLINE) {
+            $$ = sre_regex_create_noteol(pool);
+	} else {
+            $$ = sre_regex_create(pool, SRE_REGEX_TYPE_DOT, NULL, NULL);
+	}
+
         if ($$ == NULL) {
             YYABORT;
         }
@@ -341,7 +348,7 @@ atom: '(' count alt ')'
 
 
 static int
-yylex(YYSTYPE *lvalp, YYLTYPE *locp, sre_pool_t *pool, sre_char **src)
+yylex(YYSTYPE *lvalp, YYLTYPE *locp, sre_pool_t *pool, sre_char **src, int flags)
 {
     sre_char             c;
     int                  from, to;
@@ -842,22 +849,11 @@ yylex(YYSTYPE *lvalp, YYLTYPE *locp, sre_pool_t *pool, sre_char **src)
         case 'N':
             /* \N is defined as [^\n] */
 
-            r = sre_regex_create(pool, SRE_REGEX_TYPE_NCLASS, NULL,
-                                 NULL);
+            r = sre_regex_create_noteol(pool);
+
             if (r == NULL) {
                 break;
             }
-
-            range = sre_palloc(pool, sizeof(sre_regex_range_t));
-            if (range == NULL) {
-                break;
-            }
-
-            range->from = '\n';
-            range->to = '\n';
-            range->next = NULL;
-
-            r->data.range = range;
 
             lvalp->re = r;
             locp->last = *src;
@@ -866,8 +862,12 @@ yylex(YYSTYPE *lvalp, YYLTYPE *locp, sre_pool_t *pool, sre_char **src)
         case 'C':
             /* \C is defined as . */
 
-            r = sre_regex_create(pool, SRE_REGEX_TYPE_DOT, NULL,
-                                 NULL);
+	    if (flags & SRE_REGEX_NEWLINE) {
+		r = sre_regex_create_noteol(pool);
+	    } else {
+		r = sre_regex_create(pool, SRE_REGEX_TYPE_DOT, NULL, NULL);
+	    }
+
             if (r == NULL) {
                 break;
             }
@@ -1659,7 +1659,6 @@ process_char:
 
                 if (last) {
                     last->next = range;
-
                 } else {
                     r->data.range = range;
                 }
@@ -1667,7 +1666,27 @@ process_char:
                 last = range;
                 break;
             }
+
         }
+
+	if (flags & SRE_REGEX_NEWLINE) {
+	    if (!last) {
+		locp->last = *src;
+		return SRE_REGEX_TOKEN_BAD;
+	    }
+
+	    range = sre_palloc(pool, sizeof(sre_regex_range_t));
+	    if (range == NULL) {
+		locp->last = *src;
+		return SRE_REGEX_TOKEN_BAD;
+	    }
+
+	    range->from = '\n';
+	    range->to = '\n';
+	    range->next = NULL;
+
+	    last->next = range;
+	}
 
         break;
 
@@ -1966,6 +1985,28 @@ sre_regex_parse_multi(sre_pool_t *pool, sre_char **regexes,
     return re;
 }
 
+static sre_regex_t *
+sre_regex_create_noteol(sre_pool_t *pool)
+{
+    sre_regex_t *r = sre_regex_create(pool, SRE_REGEX_TYPE_NCLASS, NULL,
+			 NULL);
+    if (r == NULL) {
+	return NULL;
+    }
+
+    sre_regex_range_t *range = sre_palloc(pool, sizeof(sre_regex_range_t));
+    if (range == NULL) {
+	return NULL;
+    }
+
+    range->from = '\n';
+    range->to = '\n';
+    range->next = NULL;
+
+    r->data.range = range;
+
+    return r;
+}
 
 static sre_regex_t *
 sre_regex_desugar_counted_repetition(sre_pool_t *pool, sre_regex_t *subj,
